@@ -160,16 +160,17 @@ void WasapiRenderer::renderThread()
 
         if (framesAvailable > 0)
         {
-            // --- 新增：环缓溢出自修复 ---
-            size_t availableSamples = ringBuffer_->availableToRead();
-            size_t thresholdSamples = (size_t)(40 * sampleRate_ / 1000 * channels_ * 2);
-            if (availableSamples > thresholdSamples) {
-                printf("[WASAPI] 警告: 环缓延迟过高 (可读样本 %zu > 阈值 %zu)，执行重置\n", availableSamples, thresholdSamples);
-                ringBuffer_->reset();
-                availableSamples = 0;
-            }
-            // ---------------------------
-
+            // // --- 新增：环缓溢出自修复 ---
+            // size_t availableSamples = ringBuffer_->availableToRead();
+            // size_t thresholdSamples = (size_t)(40 * sampleRate_ / 1000 * channels_ * 2);
+            // if (availableSamples > thresholdSamples) {
+            //     printf("[WASAPI] 警告: 环缓延迟过高 (可读样本 %zu > 阈值 %zu)，执行重置\n", availableSamples, thresholdSamples);
+            //     ringBuffer_->reset();
+            //     availableSamples = 0;
+            // }
+            // // ---------------------------
+            // 感觉效果不行啊延迟是变低了稳定性有点烂
+            
             BYTE *pData = nullptr;
             pRenderClient_->GetBuffer(framesAvailable, &pData);
 
