@@ -54,7 +54,7 @@ bool WasapiRenderer::init(uint32_t sampleRate, uint8_t channels, RingBuffer *rin
         return false;
     }
 
-    // 尝试请求共享模式，但使用我们需要的格式
+    // 构建目标 PCM 格式（float32, 请求的采样率/声道数）
     WAVEFORMATEX wfx = {0};
     wfx.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
     wfx.nChannels = channels;
@@ -64,13 +64,18 @@ bool WasapiRenderer::init(uint32_t sampleRate, uint8_t channels, RingBuffer *rin
     wfx.nAvgBytesPerSec = sampleRate * wfx.nBlockAlign;
     wfx.cbSize = 0;
 
-    // 尝试初始化音频客户端
-    hr = pAudioClient_->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 100000, 0, &wfx, nullptr);
+    // 共享模式 + 自动 PCM 转换 + 默认质量重采样 + 事件回调
+    // 这样无论设备原生格式如何，WASAPI 都会帮我们做格式转换和重采样
+    DWORD streamFlags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
+                        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                        AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+
+    hr = pAudioClient_->Initialize(AUDCLNT_SHAREMODE_SHARED, streamFlags, 100000, 0, &wfx, nullptr);
     if (FAILED(hr))
     {
-        printf("[WASAPI] 优先格式 Initialize 失败: 0x%08lX, 尝试获取混合格式...\n", hr);
+        printf("[WASAPI] 带自动转换的 Initialize 失败: 0x%08lX, 回退到设备混合格式...\n", hr);
 
-        // 如果失败，获取设备原生格式进行初始化
+        // 极简回退：旧系统或特殊设备不支持自动转换标志
         WAVEFORMATEX *pMixFormat = nullptr;
         hr = pAudioClient_->GetMixFormat(&pMixFormat);
         if (FAILED(hr))
@@ -79,7 +84,7 @@ bool WasapiRenderer::init(uint32_t sampleRate, uint8_t channels, RingBuffer *rin
         CoTaskMemFree(pMixFormat);
         if (FAILED(hr))
         {
-            printf("[WASAPI] 混合格式 Initialize 失败: 0x%08lX\n", hr);
+            printf("[WASAPI] 回退初始化也失败: 0x%08lX\n", hr);
             return false;
         }
     }
