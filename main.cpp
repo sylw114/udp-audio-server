@@ -148,6 +148,13 @@ void tcpHandler()
             std::lock_guard<std::mutex> lock(g_configMutex);
             g_configReady = false;
         }
+        // 关闭 UDP socket 以唤醒主线程阻塞的 recvfrom (同 Ctrl+C 机制)
+        if (g_udpSocket != INVALID_SOCKET)
+        {
+            shutdown(g_udpSocket, SD_BOTH);
+            closesocket(g_udpSocket);
+            g_udpSocket = INVALID_SOCKET;
+        }
         closesocket(client);
     }
 }
@@ -241,6 +248,13 @@ int main(int argc, char *argv[])
 
         if (!initialized)
         {
+            // 若 UDP socket 已被关闭（TCP 断开导致），重新创建以等待新客户端
+            if (g_udpSocket == INVALID_SOCKET)
+            {
+                g_udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+                if (g_udpSocket != INVALID_SOCKET)
+                    bind(g_udpSocket, (sockaddr *)&addr, sizeof(addr));
+            }
             Sleep(100);
             continue;
         }
@@ -316,7 +330,8 @@ int main(int argc, char *argv[])
     }
     g_running = false;
     tcpThread.join();
-    closesocket(g_udpSocket);
+    if (g_udpSocket != INVALID_SOCKET)
+        closesocket(g_udpSocket);
     WSACleanup();
     return 0;
 }
