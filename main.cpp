@@ -33,6 +33,7 @@
 static std::atomic<bool> g_running{true};
 static SOCKET g_udpSocket = INVALID_SOCKET;
 static SOCKET g_tcpSocket = INVALID_SOCKET;
+static SOCKET g_tcpClient = INVALID_SOCKET;   // 当前 TCP 客户端连接，供渲染线程超时时关闭
 static uint16_t g_tcpPort = 9000;
 static uint16_t g_udpPort = 9000;
 static std::mutex g_configMutex;
@@ -89,6 +90,7 @@ void tcpHandler()
             continue;
 
         printf("[TCP] 客户端已连接\n");
+        g_tcpClient = client;
 
         TcpConfigPacket config;
         int received = recv(client, (char *)&config, sizeof(config), 0);
@@ -156,6 +158,7 @@ void tcpHandler()
             g_udpSocket = INVALID_SOCKET;
         }
         closesocket(client);
+        g_tcpClient = INVALID_SOCKET;
     }
 }
 
@@ -199,6 +202,18 @@ int main(int argc, char *argv[])
     uint8_t expectedSeq = 0;
 
     printf("[Server] 等待客户端配置...\n");
+
+    // 渲染线程超时 → 关闭 TCP 客户端连接 → tcpHandler 检测到断开 → 走清理路径
+    renderer.onFatalTimeout = []() {
+        printf("[WASAPI] 渲染线程超时，关闭 TCP 客户端连接以触发清理\n");
+        SOCKET s = g_tcpClient;
+        if (s != INVALID_SOCKET)
+        {
+            shutdown(s, SD_BOTH);
+            closesocket(s);
+            g_tcpClient = INVALID_SOCKET;
+        }
+    };
 
     uint8_t recvBuf[65536];
     sockaddr_in clientAddr;

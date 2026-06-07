@@ -16,6 +16,7 @@
 #include <atomic>
 #include <thread>
 #include <vector>
+#include <functional>
 
 class WasapiRenderer {
 public:
@@ -45,6 +46,9 @@ public:
     bool isRunning() const { return running_.load(std::memory_order_relaxed); }
     bool isBufferLow() const { return bufferLow_.load(std::memory_order_relaxed); }
     void setBufferLow(bool low) { bufferLow_.store(low, std::memory_order_relaxed); }
+
+    // 渲染线程致命超时回调（由主线程设置，触发 TCP 断连）
+    std::function<void()> onFatalTimeout;
 
 private:
     void renderThread();

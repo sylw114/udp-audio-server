@@ -154,8 +154,15 @@ void WasapiRenderer::renderThread()
     {
         // WASAPI 渲染驱动
         DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, 2000);
-        if (waitResult == WAIT_OBJECT_0 + 1 || waitResult == WAIT_TIMEOUT)
+        if (waitResult == WAIT_OBJECT_0 + 1)
             break;
+        if (waitResult == WAIT_TIMEOUT)
+        {
+            printf("[WASAPI] 渲染事件超时(2s)，触发连接断开...\n");
+            if (onFatalTimeout)
+                onFatalTimeout();
+            break;
+        }
         if (waitResult != WAIT_OBJECT_0)
             continue;
 
