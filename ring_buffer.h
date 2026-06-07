@@ -2,25 +2,26 @@
 // ============================================================================
 // ring_buffer.h — Lock-Free SPSC (Single Producer Single Consumer) Ring Buffer
 // 
-// 网络线程（生产者）写入 Float32 音频帧
-// WASAPI 渲染线程（消费者）读取 Float32 音频帧
+// 网络线程（生产者）写入 int16_t 音频帧
+// WASAPI 渲染线程（消费者）读取 int16_t 音频帧
 // 无锁设计，使用 std::atomic acquire/release 语义
 // ============================================================================
 
 #include <atomic>
 #include <cstring>
 #include <algorithm>
+#include <cstdint>
 
 class RingBuffer {
 public:
-    // capacity: 环形缓冲区容量，单位为 float 样本数（frames * channels）
+    // capacity: 环形缓冲区容量，单位为 int16_t 样本数（frames * channels）
     // 强制调整为 2 的幂以支持高效的掩码操作
     RingBuffer(size_t capacity_samples)
     {
         capacity_ = nextPowerOf2(capacity_samples);
         mask_ = capacity_ - 1;
-        buffer_ = new float[capacity_];
-        memset(buffer_, 0, capacity_ * sizeof(float));
+        buffer_ = new int16_t[capacity_];
+        memset(buffer_, 0, capacity_ * sizeof(int16_t));
         head_.store(0, std::memory_order_relaxed);
         tail_.store(0, std::memory_order_relaxed);
     }
@@ -33,9 +34,9 @@ public:
     RingBuffer(const RingBuffer&) = delete;
     RingBuffer& operator=(const RingBuffer&) = delete;
 
-    // 生产者调用：写入 count 个 float 样本
+    // 生产者调用：写入 count 个 int16_t 样本
     // 返回实际写入的样本数
-    size_t write(const float* data, size_t count) {
+    size_t write(const int16_t* data, size_t count) {
         const size_t current_head = head_.load(std::memory_order_relaxed);
         const size_t current_tail = tail_.load(std::memory_order_acquire);
 
@@ -48,18 +49,18 @@ public:
         const size_t first_chunk = std::min(to_write, capacity_ - head_index);
         const size_t second_chunk = to_write - first_chunk;
 
-        memcpy(buffer_ + head_index, data, first_chunk * sizeof(float));
+        memcpy(buffer_ + head_index, data, first_chunk * sizeof(int16_t));
         if (second_chunk > 0) {
-            memcpy(buffer_, data + first_chunk, second_chunk * sizeof(float));
+            memcpy(buffer_, data + first_chunk, second_chunk * sizeof(int16_t));
         }
 
         head_.store(current_head + to_write, std::memory_order_release);
         return to_write;
     }
 
-    // 消费者调用：读取 count 个 float 样本
+    // 消费者调用：读取 count 个 int16_t 样本
     // 返回实际读取的样本数
-    size_t read(float* data, size_t count) {
+    size_t read(int16_t* data, size_t count) {
         const size_t current_tail = tail_.load(std::memory_order_relaxed);
         const size_t current_head = head_.load(std::memory_order_acquire);
 
@@ -72,9 +73,9 @@ public:
         const size_t first_chunk = std::min(to_read, capacity_ - tail_index);
         const size_t second_chunk = to_read - first_chunk;
 
-        memcpy(data, buffer_ + tail_index, first_chunk * sizeof(float));
+        memcpy(data, buffer_ + tail_index, first_chunk * sizeof(int16_t));
         if (second_chunk > 0) {
-            memcpy(data + first_chunk, buffer_, second_chunk * sizeof(float));
+            memcpy(data + first_chunk, buffer_, second_chunk * sizeof(int16_t));
         }
 
         tail_.store(current_tail + to_read, std::memory_order_release);
@@ -107,7 +108,7 @@ private:
         return n + 1;
     }
 
-    float*              buffer_;
+    int16_t*            buffer_;
     size_t              capacity_;
     size_t              mask_;
     // 使用 alignas 避免 false sharing

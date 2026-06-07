@@ -54,13 +54,13 @@ bool WasapiRenderer::init(uint32_t sampleRate, uint8_t channels, RingBuffer *rin
         return false;
     }
 
-    // 构建目标 PCM 格式（float32, 请求的采样率/声道数）
+    // 构建目标 PCM 格式（PCM 16-bit, 请求的采样率/声道数）
     WAVEFORMATEX wfx = {0};
-    wfx.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+    wfx.wFormatTag = WAVE_FORMAT_PCM;
     wfx.nChannels = channels;
     wfx.nSamplesPerSec = sampleRate;
-    wfx.wBitsPerSample = 32;
-    wfx.nBlockAlign = channels * 4;
+    wfx.wBitsPerSample = 16;
+    wfx.nBlockAlign = channels * 2;
     wfx.nAvgBytesPerSec = sampleRate * wfx.nBlockAlign;
     wfx.cbSize = 0;
 
@@ -186,11 +186,11 @@ void WasapiRenderer::renderThread()
             BYTE *pData = nullptr;
             pRenderClient_->GetBuffer(framesAvailable, &pData);
 
-            size_t readSamples = ringBuffer_->read(reinterpret_cast<float *>(pData), (size_t)framesAvailable * channels_);
+            size_t readSamples = ringBuffer_->read(reinterpret_cast<int16_t *>(pData), (size_t)framesAvailable * channels_);
 
             if (readSamples < (size_t)framesAvailable * channels_)
             {
-                memset(pData + readSamples * sizeof(float), 0, (framesAvailable * channels_ - readSamples) * sizeof(float));
+                memset(pData + readSamples * sizeof(int16_t), 0, (framesAvailable * channels_ - readSamples) * sizeof(int16_t));
                 silenceFillCount_++;
                 setBufferLow(true);
                 printf("[WASAPI] 填充静音: 需要 %u 样本, 但只读到 %zu 样本，环缓余量 %zu\n", framesAvailable * channels_, readSamples, ringBuffer_->availableToRead());

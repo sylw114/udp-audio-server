@@ -278,25 +278,18 @@ int main(int argc, char *argv[])
         const uint8_t* pcmData = recvBuf + 1;
         size_t pcmLen = bytesReceived - 1;
 
-        auto writeToRingBuffer = [&](const uint8_t *data, size_t len)
-        {
-            std::vector<float> floatBuf(len / 2);
-            convertInt16ToFloat32((const int16_t *)data, floatBuf.data(), floatBuf.size());
-            ringBuffer->write(floatBuf.data(), floatBuf.size());
-        };
-
         if (discardOutOfOrder) {
             if (isNewer(expectedSeq - 1, seq)) {
                 if (seq != expectedSeq) {
                     printf("[UDP] [DiscardMode] 跳包: 期望 %u, 收到 %u, 跳过区间 [%u, %u]\n", expectedSeq, seq, expectedSeq, (uint8_t)(seq - 1));
                 }
-                writeToRingBuffer(pcmData, pcmLen);
+                ringBuffer->write(reinterpret_cast<const int16_t*>(pcmData), pcmLen / sizeof(int16_t));
                 expectedSeq = seq + 1;
             }
         } else {
             if (isNewer(expectedSeq - 1, seq)) {
                 if (seq == expectedSeq) {
-                    writeToRingBuffer(pcmData, pcmLen);
+                    ringBuffer->write(reinterpret_cast<const int16_t*>(pcmData), pcmLen / sizeof(int16_t));
                     renderer.setBufferLow(false);
                     expectedSeq++;
                 } else {
@@ -315,7 +308,7 @@ int main(int argc, char *argv[])
                 while (sortingArea[expectedSeq]) {
                     StoredPacket* p = sortingArea[expectedSeq];
                     printf("[UDP] [Reorder] 释放排序包: 序号 %u\n", expectedSeq);
-                    writeToRingBuffer(p->data.data(), p->data.size());
+                    ringBuffer->write(reinterpret_cast<const int16_t*>(p->data.data()), p->data.size() / sizeof(int16_t));
                     delete p;
                     sortingArea[expectedSeq] = nullptr;
                     expectedSeq++;
