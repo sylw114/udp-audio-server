@@ -41,9 +41,8 @@ static bool g_configReady = false;
 static uint32_t g_sampleRate = 48000;
 static uint8_t g_channels = 2;
 
-static std::mutex g_udpStatsMutex;
-static uint8_t g_lastUdpSeq = 0;
-static uint64_t g_lastUdpTimestamp = 0;
+static std::atomic<uint8_t> g_lastUdpSeq{0};
+static std::atomic<uint64_t> g_lastUdpTimestamp{0};
 
 static void signalHandler(int sig)
 {
@@ -116,13 +115,8 @@ void tcpHandler()
 
                     uint8_t response[17];
 
-                    uint8_t lastSeq;
-                    uint64_t lastUdpTs;
-                    {
-                        std::lock_guard<std::mutex> lock(g_udpStatsMutex);
-                        lastSeq = g_lastUdpSeq;
-                        lastUdpTs = g_lastUdpTimestamp;
-                    }
+                    uint8_t lastSeq = g_lastUdpSeq.load(std::memory_order_relaxed);
+                    uint64_t lastUdpTs = g_lastUdpTimestamp.load(std::memory_order_relaxed);
 
                     response[0] = lastSeq;
 
@@ -329,13 +323,12 @@ int main(int argc, char *argv[])
             }
         }
 
-        {
-            std::lock_guard<std::mutex> lock(g_udpStatsMutex);
-            g_lastUdpSeq = seq;
-            g_lastUdpTimestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::system_clock::now().time_since_epoch())
-                                     .count();
-        }
+        g_lastUdpSeq.store(seq, std::memory_order_relaxed);
+        g_lastUdpTimestamp.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count(),
+            std::memory_order_relaxed);
     }
 
     if (initialized)
