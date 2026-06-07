@@ -245,9 +245,7 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        // --- 等待数据 ---
-        DWORD timeout = 10;
-        setsockopt(g_udpSocket, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+        // --- 等待数据（阻塞直到有数据到达） ---
         int bytesReceived = recvfrom(g_udpSocket, (char *)recvBuf, sizeof(recvBuf), 0, (sockaddr *)&clientAddr, &clientLen);
 
         if (bytesReceived <= 0)
@@ -280,7 +278,7 @@ int main(int argc, char *argv[])
                     expectedSeq++;
                 } else {
                     if (uint8_t(seq - expectedSeq) >= 4 || renderer.isBufferLow()) {
-                         printf("[UDP] [Reorder] 强制跳过: 期望 %u, 收到 %u, 跳过区间 [%u, %u]\n", expectedSeq, seq, expectedSeq, (uint8_t)(seq - 1));
+                         printf("[UDP] [Reorder] 强制跳过: 期望 %u, 收到 %u, 跳过%u\n", expectedSeq, seq, expectedSeq);
                          // 强制跳过，直接将期望更新到 seq
                          expectedSeq++;
                     }
