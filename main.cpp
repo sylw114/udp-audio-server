@@ -41,8 +41,12 @@ static bool g_configReady = false;
 static uint32_t g_sampleRate = 48000;
 static uint8_t g_channels = 2;
 
-static std::atomic<uint8_t> g_lastUdpSeq{0};
-static std::atomic<uint64_t> g_lastUdpTimestamp{0};
+// 每个序号最早到达时间（ms），0 表示未到达；由 UDP 主线程写，TCP 线程读
+static std::atomic<uint64_t> g_seqTimestamps[256];
+// 上次心跳回复时已发送到的区间终点（即本次区间起点）
+static std::atomic<uint8_t> g_hbLastEndSeq{0};
+// 当前 expectedSeq，由 UDP 主线程维护，供 TCP 线程读取
+static std::atomic<uint8_t> g_expectedSeq{0};
 
 static void signalHandler(int sig)
 {
@@ -112,30 +116,36 @@ void tcpHandler()
                 if (bytesRead >= (int)sizeof(HeartbeatRequest))
                 {
                     HeartbeatRequest *req = (HeartbeatRequest *)hbBuf;
+                    (void)req;
+                    uint8_t endSeq = g_expectedSeq.load(std::memory_order_relaxed);
+                    uint8_t startSeq = g_hbLastEndSeq.load(std::memory_order_relaxed);
 
-                    uint8_t response[17];
+                    // 包头 2 字节（大端序总长度）+ 最多 256 个序号每条 9 字节 + 末尾 8 字节服务端时间戳
+                    uint8_t response[2 + 256 * 9 + 8];
+                    int offset = 2; // 预留包头
 
-                    uint8_t lastSeq = g_lastUdpSeq.load(std::memory_order_relaxed);
-                    uint64_t lastUdpTs = g_lastUdpTimestamp.load(std::memory_order_relaxed);
-
-                    response[0] = lastSeq;
-
-                    // 2. UDP包接收时间戳 (8B, Big Endian)
-                    for (int i = 0; i < 8; ++i)
+                    uint8_t cur = startSeq;
+                    while (cur != endSeq)
                     {
-                        response[1 + i] = (uint8_t)(lastUdpTs >> ((7 - i) * 8));
+                        uint64_t ts = g_seqTimestamps[cur].load(std::memory_order_relaxed);
+                        response[offset++] = cur;
+                        for (int i = 0; i < 8; ++i)
+                            response[offset++] = (uint8_t)(ts >> ((7 - i) * 8));
+                        ++cur; // uint8_t 自动回绕
                     }
 
-                    // 3. ServerTimestamp (8B, Big Endian)
                     uint64_t sTs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                        std::chrono::system_clock::now().time_since_epoch())
                                        .count();
                     for (int i = 0; i < 8; ++i)
-                    {
-                        response[9 + i] = (uint8_t)(sTs >> ((7 - i) * 8));
-                    }
+                        response[offset++] = (uint8_t)(sTs >> ((7 - i) * 8));
 
-                    send(client, (char *)response, sizeof(response), 0);
+                    // 回填包头：总长度（含头部 2 字节）
+                    response[0] = (uint8_t)(offset >> 8);
+                    response[1] = (uint8_t)(offset);
+
+                    g_hbLastEndSeq.store(endSeq, std::memory_order_relaxed);
+                    send(client, (char *)response, offset, 0);
                 }
             }
         }
@@ -236,6 +246,9 @@ int main(int argc, char *argv[])
                 expectedSeq = 0;
                 renderer.setBufferLow(false);
                 for(int i=0; i<256; ++i) { delete sortingArea[i]; sortingArea[i] = nullptr; }
+                for (int i = 0; i < 256; ++i) g_seqTimestamps[i].store(0, std::memory_order_relaxed);
+                g_hbLastEndSeq.store(0, std::memory_order_relaxed);
+                g_expectedSeq.store(0, std::memory_order_relaxed);
                 printf("[Server] 渲染器初始化完成\n");
             }
             else
@@ -316,12 +329,15 @@ int main(int argc, char *argv[])
             }
         }
 
-        g_lastUdpSeq.store(seq, std::memory_order_relaxed);
-        g_lastUdpTimestamp.store(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch())
-                .count(),
-            std::memory_order_relaxed);
+        {
+            uint64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+            uint64_t prev = g_seqTimestamps[seq].load(std::memory_order_relaxed);
+            if (prev == 0 || now - prev > 300)
+                g_seqTimestamps[seq].store(now, std::memory_order_relaxed);
+        }
+        g_expectedSeq.store(expectedSeq, std::memory_order_relaxed);
     }
 
     if (initialized)

@@ -27,11 +27,13 @@ struct TcpConfigPacket {
 #pragma pack(pop)
 
 // TCP 延迟反馈包 (服务端 -> 客户端)
+// 格式: [(seq u8)(udpRecvTs u64 BE)] * N + (serverTs u64 BE)
+// 时间戳单位: ms (Unix 纪元)
 #pragma pack(push, 1)
 struct TcpLatencyPacket {
     uint8_t seq;
-    uint64_t udpRecvTs; // microseconds, big-endian
-    uint64_t serverTs;  // microseconds, big-endian
+    uint64_t udpRecvTs; // ms, big-endian
+    uint64_t serverTs;  // ms, big-endian
 };
 #pragma pack(pop)
 
