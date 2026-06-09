@@ -172,10 +172,18 @@ int main(int argc, char *argv[])
     setvbuf(stdout, NULL, _IONBF, 0);
 
     bool discardOutOfOrder = false;
+    uint32_t dropBaselineMs = 0;
+    uint32_t protectMs = 50;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--discard-out-of-order") == 0) {
             discardOutOfOrder = true;
             printf("[System] 已启用丢弃乱序包模式\n");
+        } else if (strcmp(argv[i], "--drop-baseline-duration-ms") == 0 && i + 1 < argc) {
+            dropBaselineMs = (uint32_t)atoi(argv[++i]);
+            printf("[System] 丢弃率基准延迟: %u ms\n", dropBaselineMs);
+        } else if (strcmp(argv[i], "--protect-ms") == 0 && i + 1 < argc) {
+            protectMs = (uint32_t)atoi(argv[++i]);
+            printf("[System] 丢弃保护延迟: %u ms\n", protectMs);
         } else if (strcmp(argv[i], "--tcp") == 0 && i + 1 < argc) {
             g_tcpPort = (uint16_t)atoi(argv[++i]);
             printf("[System] TCP 端口已设置为 %u\n", g_tcpPort);
@@ -242,6 +250,8 @@ int main(int argc, char *argv[])
             if (renderer.init(sr, ch, ringBuffer))
             {
                 renderer.start();
+                renderer.setDropBaseline(dropBaselineMs);
+                renderer.setProtect(protectMs);
                 initialized = true;
                 expectedSeq = 0;
                 renderer.setBufferLow(false);

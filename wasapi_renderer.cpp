@@ -7,6 +7,7 @@
 #include <functiondiscoverykeys_devpkey.h>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <algorithm>
 
 #define SAFE_RELEASE(p)     \
@@ -183,6 +184,38 @@ void WasapiRenderer::renderThread()
             // // ---------------------------
             // 感觉效果不行啊延迟是变低了稳定性有点烂
             
+            // --- 丢弃率自适应延迟控制 ---
+            uint32_t baseline = dropBaselineDurationMs_.load(std::memory_order_relaxed);
+            if (baseline > 0)
+            {
+                size_t availSamples = ringBuffer_->availableToRead();
+                // 缓存时长 ms = 可读样本数 / (采样率 * 声道数) * 1000
+                double cachedMs = (double)availSamples / (sampleRate_ * channels_) * 1000.0;
+                double protect = (double)protectMs_.load(std::memory_order_relaxed);
+                double x = (cachedMs - protect) / ((double)baseline);
+                if (x > 0.0)
+                {
+                    double r = 1.0 - 1.0 / std::exp(x * x * x * protect / (double)baseline);
+                    // r 是丢弃率：每 1/(1-r) 帧丢弃一帧，等价于每 1/r 帧额外丢弃一帧
+                    // 分母 N = 1/r，每处理一帧累加 r，累加满1时丢弃一整帧
+                    if (r > 0.0)
+                    {
+                        dropAccum_ += r * (double)framesAvailable;
+                        size_t framesToDrop = (size_t)dropAccum_;
+                        dropAccum_ -= (double)framesToDrop;
+                        if (framesToDrop > 0)
+                        {
+                            size_t samplesToDrop = framesToDrop * channels_;
+                            // 通过读取并丢弃来推进 tail
+                            static thread_local std::vector<int16_t> dropBuf;
+                            if (dropBuf.size() < samplesToDrop) dropBuf.resize(samplesToDrop);
+                            ringBuffer_->read(dropBuf.data(), samplesToDrop);
+                        }
+                    }
+                }
+            }
+            // ------------------------------------
+
             BYTE *pData = nullptr;
             pRenderClient_->GetBuffer(framesAvailable, &pData);
 

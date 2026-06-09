@@ -46,6 +46,8 @@ public:
     bool isRunning() const { return running_.load(std::memory_order_relaxed); }
     bool isBufferLow() const { return bufferLow_.load(std::memory_order_relaxed); }
     void setBufferLow(bool low) { bufferLow_.store(low, std::memory_order_relaxed); }
+    void setDropBaseline(uint32_t ms) { dropBaselineDurationMs_.store(ms, std::memory_order_relaxed); }
+    void setProtect(uint32_t ms) { protectMs_.store(ms, std::memory_order_relaxed); }
 
     // 渲染线程致命超时回调（由主线程设置，触发 TCP 断连）
     std::function<void()> onFatalTimeout;
@@ -72,4 +74,7 @@ private:
     RingBuffer*             ringBuffer_     = nullptr;
     int                     renderCount_    = 0;
     int                     silenceFillCount_ = 0;
+    std::atomic<uint32_t>   dropBaselineDurationMs_{0};
+    std::atomic<uint32_t>   protectMs_{50};
+    double                  dropAccum_      = 0.0;
 };
