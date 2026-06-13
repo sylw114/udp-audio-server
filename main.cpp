@@ -81,7 +81,13 @@ void tcpHandler()
     sockaddr_in addr = {AF_INET};
     addr.sin_port = htons(g_tcpPort);
     addr.sin_addr.s_addr = INADDR_ANY;
-    bind(g_tcpSocket, (sockaddr *)&addr, sizeof(addr));
+    if (bind(g_tcpSocket, (sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR)
+    {
+        printf("[TCP] 绑定端口 %u 失败，端口可能被占用 (错误码: %d)\n", g_tcpPort, WSAGetLastError());
+        closesocket(g_tcpSocket);
+        WSACleanup();
+        exit(1);
+    }
     listen(g_tcpSocket, 1);
 
     while (g_running)
@@ -203,7 +209,14 @@ int main(int argc, char *argv[])
     g_udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     sockaddr_in addr = {AF_INET};
     addr.sin_port = htons(g_udpPort);
-    bind(g_udpSocket, (sockaddr *)&addr, sizeof(addr));
+    if (bind(g_udpSocket, (sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR)
+    {
+        printf("[UDP] 绑定端口 %u 失败，端口可能被占用 (错误码: %d)\n", g_udpPort, WSAGetLastError());
+        closesocket(g_udpSocket);
+        closesocket(g_tcpSocket);
+        WSACleanup();
+        exit(1);
+    }
 
     WasapiRenderer renderer;
     RingBuffer *ringBuffer = nullptr;
