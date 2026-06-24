@@ -29,5 +29,5 @@ private:
     OpusDecoder* decoder_ = nullptr;
     uint32_t sampleRate_ = 0;
     uint8_t channels_ = 0;
-    int maxFrameSamples_ = 0;
+    int frameSamples_ = 0;
 };

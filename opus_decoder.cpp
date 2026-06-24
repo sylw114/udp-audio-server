@@ -26,10 +26,7 @@ bool OpusDecoderRuntime::init(uint32_t sampleRate, uint8_t channels, uint8_t fra
 
     sampleRate_ = sampleRate;
     channels_ = channels;
-    // Opus 单包最长 120ms，按握手帧长和最大值取较大缓冲，兼容编码器少量变化。
-    int declaredFrameSamples = (int)(sampleRate * frameMs / 1000);
-    int maxOpusFrameSamples = (int)(sampleRate * 120 / 1000);
-    maxFrameSamples_ = declaredFrameSamples > maxOpusFrameSamples ? declaredFrameSamples : maxOpusFrameSamples;
+    frameSamples_ = (int)(sampleRate * frameMs / 1000);
 
     printf("[Opus] 解码器初始化成功: %u Hz, 声道: %u, 帧长: %u ms\n", sampleRate_, channels_, frameMs);
     return true;
@@ -44,7 +41,7 @@ void OpusDecoderRuntime::reset()
     }
     sampleRate_ = 0;
     channels_ = 0;
-    maxFrameSamples_ = 0;
+    frameSamples_ = 0;
 }
 
 bool OpusDecoderRuntime::decode(const uint8_t* data, size_t length, std::vector<int16_t>& pcm)
@@ -52,8 +49,8 @@ bool OpusDecoderRuntime::decode(const uint8_t* data, size_t length, std::vector<
     if (!decoder_ || !data || length == 0)
         return false;
 
-    pcm.resize((size_t)maxFrameSamples_ * channels_);
-    int decodedFrames = opus_decode(decoder_, data, (int)length, pcm.data(), maxFrameSamples_, 0);
+    pcm.resize((size_t)frameSamples_ * channels_);
+    int decodedFrames = opus_decode(decoder_, data, (int)length, pcm.data(), frameSamples_, 0);
     if (decodedFrames < 0)
     {
         printf("[Opus] 解码失败: %d\n", decodedFrames);
