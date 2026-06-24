@@ -41,3 +41,13 @@ target_link_libraries(audio_server_udp PRIVATE
     avrt
     uuid
 )
+
+install(TARGETS audio_server_udp
+    RUNTIME DESTINATION .
+    COMPONENT runtime
+)
+
+install(FILES THIRD_PARTY_NOTICES.md
+    DESTINATION .
+    COMPONENT runtime
+)
