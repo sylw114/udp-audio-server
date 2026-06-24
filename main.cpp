@@ -25,6 +25,7 @@
 #include "protocol.h"
 #include "ring_buffer.h"
 #include "wasapi_renderer.h"
+#include "opus_decoder.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "ole32.lib")
@@ -40,6 +41,9 @@ static std::mutex g_configMutex;
 static bool g_configReady = false;
 static uint32_t g_sampleRate = 48000;
 static uint8_t g_channels = 2;
+static uint8_t g_codec = AUDIO_CODEC_PCM;
+static uint8_t g_frameMs = 20;
+static uint8_t g_opusBitrateKbps = 32;
 
 // 每个序号最早到达时间（ms），0 表示未到达；由 UDP 主线程写，TCP 线程读
 static std::atomic<uint64_t> g_seqTimestamps[256];
@@ -47,6 +51,17 @@ static std::atomic<uint64_t> g_seqTimestamps[256];
 static std::atomic<uint8_t> g_hbLastEndSeq{0};
 // 当前 expectedSeq，由 UDP 主线程维护，供 TCP 线程读取
 static std::atomic<uint8_t> g_expectedSeq{0};
+
+static void closeTcpClient()
+{
+    SOCKET s = g_tcpClient;
+    if (s != INVALID_SOCKET)
+    {
+        shutdown(s, SD_BOTH);
+        closesocket(s);
+        g_tcpClient = INVALID_SOCKET;
+    }
+}
 
 static void signalHandler(int sig)
 {
@@ -75,6 +90,20 @@ struct HeartbeatRequest
 };
 #pragma pack(pop)
 
+static bool recvAll(SOCKET socket, void *buffer, int length)
+{
+    char *cursor = static_cast<char *>(buffer);
+    int total = 0;
+    while (total < length)
+    {
+        int received = recv(socket, cursor + total, length - total, 0);
+        if (received <= 0)
+            return false;
+        total += received;
+    }
+    return true;
+}
+
 void tcpHandler()
 {
     g_tcpSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -102,15 +131,58 @@ void tcpHandler()
         g_tcpClient = client;
 
         TcpConfigPacket config;
-        int received = recv(client, (char *)&config, sizeof(config), 0);
+        bool configOk = recvAll(client, &config, (int)sizeof(config));
 
-        if (received == sizeof(config))
+        if (configOk)
         {
-            printf("[TCP] 收到配置: %u Hz, 声道: %u\n", getSampleRate(config.sampleRateIdx), config.channels);
+            uint32_t sampleRate = getSampleRate(config.sampleRateIdx);
+            bool supported = true;
+            if (config.version != PROTOCOL_VERSION)
+            {
+                printf("[TCP] 不支持的协议版本: %u\n", config.version);
+                supported = false;
+            }
+            if (sampleRate == 0)
+            {
+                printf("[TCP] 不支持的采样率索引: %u\n", config.sampleRateIdx);
+                supported = false;
+            }
+            if (config.channels != 1 && config.channels != 2)
+            {
+                printf("[TCP] 不支持的声道数: %u\n", config.channels);
+                supported = false;
+            }
+            if (config.codec != AUDIO_CODEC_PCM && config.codec != AUDIO_CODEC_OPUS)
+            {
+                printf("[TCP] 不支持的编码格式: %u\n", config.codec);
+                supported = false;
+            }
+            if (config.codec == AUDIO_CODEC_OPUS &&
+                config.frameMs != 10 && config.frameMs != 20 && config.frameMs != 40)
+            {
+                printf("[TCP] 不支持的 Opus 帧长: %u ms\n", config.frameMs);
+                supported = false;
+            }
+
+            if (!supported)
+            {
+                shutdown(client, SD_BOTH);
+                closesocket(client);
+                g_tcpClient = INVALID_SOCKET;
+                continue;
+            }
+
+            printf("[TCP] 收到配置: 版本 %u, %u Hz, 声道: %u, 编码: %s, 帧长: %u ms, 码率: %u kbps\n",
+                   config.version, sampleRate, config.channels,
+                   config.codec == AUDIO_CODEC_PCM ? "PCM" : "Opus",
+                   config.frameMs, config.opusBitrateKbps);
             {
                 std::lock_guard<std::mutex> lock(g_configMutex);
-                g_sampleRate = getSampleRate(config.sampleRateIdx);
+                g_sampleRate = sampleRate;
                 g_channels = config.channels;
+                g_codec = config.codec;
+                g_frameMs = config.frameMs;
+                g_opusBitrateKbps = config.opusBitrateKbps;
                 g_configReady = true;
             }
             send(client, "\0", 1, 0); // 确认握手
@@ -219,8 +291,10 @@ int main(int argc, char *argv[])
     }
 
     WasapiRenderer renderer;
+    OpusDecoderRuntime opusDecoder;
     RingBuffer *ringBuffer = nullptr;
     bool initialized = false;
+    uint8_t activeCodec = AUDIO_CODEC_PCM;
     
     // 重排序相关
     StoredPacket* sortingArea[256] = {nullptr};
@@ -231,41 +305,63 @@ int main(int argc, char *argv[])
     // 渲染线程超时 → 关闭 TCP 客户端连接 → tcpHandler 检测到断开 → 走清理路径
     renderer.onFatalTimeout = []() {
         printf("[WASAPI] 渲染线程超时，关闭 TCP 客户端连接以触发清理\n");
-        SOCKET s = g_tcpClient;
-        if (s != INVALID_SOCKET)
-        {
-            shutdown(s, SD_BOTH);
-            closesocket(s);
-            g_tcpClient = INVALID_SOCKET;
-        }
+        closeTcpClient();
     };
 
     uint8_t recvBuf[65536];
     sockaddr_in clientAddr;
     int clientLen = sizeof(clientAddr);
+    std::vector<int16_t> decodedPcm;
+
+    auto decodeAudioPayload = [&](const uint8_t* audioData, size_t audioLen, std::vector<int16_t>& pcm) {
+        pcm.clear();
+        if (activeCodec == AUDIO_CODEC_PCM)
+        {
+            size_t sampleCount = audioLen / sizeof(int16_t);
+            const int16_t* samples = reinterpret_cast<const int16_t*>(audioData);
+            pcm.assign(samples, samples + sampleCount);
+            return true;
+        }
+
+        return opusDecoder.decode(audioData, audioLen, pcm);
+    };
+
+    auto writePcm = [&](const std::vector<int16_t>& pcm) {
+        if (!pcm.empty())
+            ringBuffer->write(pcm.data(), pcm.size());
+    };
 
     while (g_running)
     {
         bool configReady;
         uint32_t sr;
         uint8_t ch;
+        uint8_t codec;
+        uint8_t frameMs;
         {
             std::lock_guard<std::mutex> lock(g_configMutex);
             configReady = g_configReady;
             sr = g_sampleRate;
             ch = g_channels;
+            codec = g_codec;
+            frameMs = g_frameMs;
         }
 
         if (configReady && !initialized)
         {
             printf("[Server] 正在初始化渲染器...\n");
             ringBuffer = new RingBuffer((size_t)sr * ch * 2);
-            if (renderer.init(sr, ch, ringBuffer))
+            bool decoderReady = true;
+            if (codec == AUDIO_CODEC_OPUS)
+                decoderReady = opusDecoder.init(sr, ch, frameMs);
+
+            if (decoderReady && renderer.init(sr, ch, ringBuffer))
             {
                 renderer.start();
                 renderer.setDropBaseline(dropBaselineMs);
                 renderer.setProtect(protectMs);
                 initialized = true;
+                activeCodec = codec;
                 expectedSeq = 0;
                 renderer.setBufferLow(false);
                 for(int i=0; i<256; ++i) { delete sortingArea[i]; sortingArea[i] = nullptr; }
@@ -277,8 +373,10 @@ int main(int argc, char *argv[])
             else
             {
                 printf("[Server] 渲染器初始化失败！\n");
+                opusDecoder.reset();
                 delete ringBuffer;
                 ringBuffer = nullptr;
+                closeTcpClient();
                 Sleep(1000);
             }
         }
@@ -286,6 +384,7 @@ int main(int argc, char *argv[])
         {
             printf("[Server] TCP 连接断开，停止渲染\n");
             renderer.stop();
+            opusDecoder.reset();
             delete ringBuffer;
             ringBuffer = nullptr;
             initialized = false;
@@ -311,23 +410,27 @@ int main(int argc, char *argv[])
             continue;
         
         uint8_t seq = recvBuf[0];
-        const uint8_t* pcmData = recvBuf + 1;
-        size_t pcmLen = bytesReceived - 1;
+        const uint8_t* audioData = recvBuf + 1;
+        size_t audioLen = bytesReceived - 1;
 
         if (discardOutOfOrder) {
             if (isNewer(expectedSeq - 1, seq)) {
                 if (seq != expectedSeq) {
                     printf("[UDP] [DiscardMode] 跳包: 期望 %u, 收到 %u, 跳过区间 [%u, %u]\n", expectedSeq, seq, expectedSeq, (uint8_t)(seq - 1));
                 }
-                ringBuffer->write(reinterpret_cast<const int16_t*>(pcmData), pcmLen / sizeof(int16_t));
+                if (decodeAudioPayload(audioData, audioLen, decodedPcm))
+                    writePcm(decodedPcm);
                 expectedSeq = seq + 1;
             }
         } else {
             if (isNewer(expectedSeq - 1, seq)) {
                 if (seq == expectedSeq) {
-                    ringBuffer->write(reinterpret_cast<const int16_t*>(pcmData), pcmLen / sizeof(int16_t));
-                    renderer.setBufferLow(false);
-                    expectedSeq++;
+                    if (decodeAudioPayload(audioData, audioLen, decodedPcm))
+                    {
+                        writePcm(decodedPcm);
+                        renderer.setBufferLow(false);
+                        expectedSeq++;
+                    }
                 } else {
                     if (uint8_t(seq - expectedSeq) >= 4 || renderer.isBufferLow()) {
                          printf("[UDP] [Reorder] 强制跳过: 期望 %u, 收到 %u, 跳过%u\n", expectedSeq, seq, expectedSeq);
@@ -335,8 +438,11 @@ int main(int argc, char *argv[])
                          expectedSeq++;
                     }
                     if (!sortingArea[seq]) {
-                        printf("[UDP] [Reorder] 加入排序区: 序号 %u\n", seq);
-                        sortingArea[seq] = new StoredPacket{std::vector<uint8_t>(pcmData, pcmData + pcmLen)};
+                        if (decodeAudioPayload(audioData, audioLen, decodedPcm))
+                        {
+                            printf("[UDP] [Reorder] 加入排序区: 序号 %u\n", seq);
+                            sortingArea[seq] = new StoredPacket{decodedPcm};
+                        }
                     }
                 }
                 
@@ -344,7 +450,7 @@ int main(int argc, char *argv[])
                 while (sortingArea[expectedSeq]) {
                     StoredPacket* p = sortingArea[expectedSeq];
                     printf("[UDP] [Reorder] 释放排序包: 序号 %u\n", expectedSeq);
-                    ringBuffer->write(reinterpret_cast<const int16_t*>(p->data.data()), p->data.size() / sizeof(int16_t));
+                    writePcm(p->pcm);
                     delete p;
                     sortingArea[expectedSeq] = nullptr;
                     expectedSeq++;

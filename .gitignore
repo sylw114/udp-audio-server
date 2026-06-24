@@ -1,5 +1,25 @@
+# 构建产物
+/build/
+/subbuild/*.exe
+/subbuild/*.pdb
+/subbuild/*.ilk
 *.obj
 *.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# CMake / Ninja 临时文件
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+build.ninja
+.ninja_deps
+.ninja_log
+
+# 本地工具配置
 CLAUDE.md
-.atomcode/
 AGENTS.md
+.atomcode/
+.claude/

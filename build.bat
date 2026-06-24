@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================================
-REM build.bat - UDP C++ Audio Server Build Script
+REM build.bat - UDP C++ Audio Server CMake Build Script
 REM ============================================================================
 
 setlocal enabledelayedexpansion
@@ -34,21 +34,46 @@ if not exist "%VCVARSALL%" (
     exit /b 1
 )
 
+where cmake >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] cmake.exe not found.
+    exit /b 1
+)
+
 echo [INFO] Setting up x64 build environment...
 call "%VCVARSALL%" x64 >nul 2>&1
 
-echo [INFO] Compiling...
-echo.
+set "BUILD_DIR=build\cmake"
+set "DIST_DIR=subbuild"
 
-cl.exe /nologo /EHsc /O2 /utf-8 /std:c++17 /W3 ^
-    /D_UNICODE /DUNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
-    main.cpp wasapi_renderer.cpp ^
-    /Fe:./subbuild/audio_server_udp.exe ^
-    /link ws2_32.lib ole32.lib avrt.lib uuid.lib
-
+echo [INFO] Configuring CMake...
+cmake -S . -B "%BUILD_DIR%" -G "Ninja" -DCMAKE_BUILD_TYPE=Release
 if errorlevel 1 (
     echo.
-    echo [ERROR] Compilation failed!
+    echo [ERROR] CMake configure failed!
+    exit /b 1
+)
+
+echo.
+echo [INFO] Building...
+cmake --build "%BUILD_DIR%" --config Release
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Build failed!
+    exit /b 1
+)
+
+echo.
+echo [INFO] Publishing to %DIST_DIR%...
+if not exist "%DIST_DIR%" mkdir "%DIST_DIR%"
+copy /Y "%BUILD_DIR%\audio_server_udp.exe" "%DIST_DIR%\audio_server_udp.exe" >nul
+if errorlevel 1 (
+    echo [ERROR] Failed to copy audio_server_udp.exe.
+    exit /b 1
+)
+copy /Y "THIRD_PARTY_NOTICES.md" "%DIST_DIR%\THIRD_PARTY_NOTICES.md" >nul
+if errorlevel 1 (
+    echo [ERROR] Failed to copy THIRD_PARTY_NOTICES.md.
     exit /b 1
 )
 
