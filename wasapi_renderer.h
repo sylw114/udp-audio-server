@@ -55,6 +55,9 @@ public:
 
 private:
     void renderThread();
+    void fadeInAfterSilence(int16_t* samples, size_t sampleCount);
+    void fillSmoothSilence(int16_t* samples, size_t startSample, size_t totalSamples);
+    void rememberLastSamples(const int16_t* samples, size_t sampleCount);
 
     HMODULE                 hRelinkDll_     = nullptr;
     IMMDeviceEnumerator*    pEnumerator_    = nullptr;
@@ -79,4 +82,6 @@ private:
     std::atomic<uint32_t>   protectMs_{50};
     TimeStretcher           timeStretcher_;
     std::vector<int16_t>    stretchInputBuf_;
+    std::vector<int16_t>    lastOutputSamples_;
+    bool                    recoveringFromSilence_ = false;
 };

@@ -27,6 +27,8 @@ bool WasapiRenderer::init(uint32_t sampleRate, uint8_t channels, RingBuffer *rin
     channels_ = channels;
     ringBuffer_ = ringBuffer;
     timeStretcher_.init(sampleRate, channels);
+    lastOutputSamples_.assign(channels, 0);
+    recoveringFromSilence_ = false;
 
     hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE)
@@ -100,6 +102,69 @@ bool WasapiRenderer::init(uint32_t sampleRate, uint8_t channels, RingBuffer *rin
 
     printf("[WASAPI] 初始化成功, bufferFrames: %u\n", bufferFrames_);
     return true;
+}
+
+void WasapiRenderer::fadeInAfterSilence(int16_t* samples, size_t sampleCount)
+{
+    if (!recoveringFromSilence_ || channels_ == 0 || sampleCount == 0)
+        return;
+
+    size_t frameCount = sampleCount / channels_;
+    size_t fadeFrames = std::min(frameCount, (size_t)std::max<uint32_t>(1, sampleRate_ / 200));
+    for (size_t frame = 0; frame < fadeFrames; ++frame)
+    {
+        int32_t gain = (int32_t)(frame + 1);
+        int32_t denom = (int32_t)fadeFrames;
+        for (uint8_t ch = 0; ch < channels_; ++ch)
+        {
+            size_t index = frame * channels_ + ch;
+            samples[index] = (int16_t)((int32_t)samples[index] * gain / denom);
+        }
+    }
+
+    recoveringFromSilence_ = false;
+}
+
+void WasapiRenderer::fillSmoothSilence(int16_t* samples, size_t startSample, size_t totalSamples)
+{
+    if (channels_ == 0 || startSample >= totalSamples)
+        return;
+
+    size_t startFrame = startSample / channels_;
+    size_t totalFrames = totalSamples / channels_;
+    size_t fillFrames = totalFrames - startFrame;
+    size_t fadeFrames = std::min(fillFrames, (size_t)std::max<uint32_t>(1, sampleRate_ / 200));
+
+    for (size_t frame = 0; frame < fillFrames; ++frame)
+    {
+        int32_t gain = frame < fadeFrames ? (int32_t)(fadeFrames - frame) : 0;
+        int32_t denom = (int32_t)fadeFrames;
+        for (uint8_t ch = 0; ch < channels_; ++ch)
+        {
+            int16_t start = 0;
+            if (startSample >= channels_)
+                start = samples[(startFrame - 1) * channels_ + ch];
+            else if (ch < lastOutputSamples_.size())
+                start = lastOutputSamples_[ch];
+
+            size_t index = (startFrame + frame) * channels_ + ch;
+            samples[index] = frame < fadeFrames ? (int16_t)((int32_t)start * gain / denom) : 0;
+        }
+    }
+
+    recoveringFromSilence_ = true;
+}
+
+void WasapiRenderer::rememberLastSamples(const int16_t* samples, size_t sampleCount)
+{
+    if (channels_ == 0 || sampleCount < channels_)
+        return;
+
+    size_t lastFrame = sampleCount / channels_ - 1;
+    if (lastOutputSamples_.size() != channels_)
+        lastOutputSamples_.assign(channels_, 0);
+    for (uint8_t ch = 0; ch < channels_; ++ch)
+        lastOutputSamples_[ch] = samples[lastFrame * channels_ + ch];
 }
 
 bool WasapiRenderer::start()
@@ -229,13 +294,18 @@ void WasapiRenderer::renderThread()
                 readSamples = timeStretcher_.readOutput(reinterpret_cast<int16_t *>(pData), needSamples);
             }
 
+            if (readSamples > 0)
+                fadeInAfterSilence(reinterpret_cast<int16_t *>(pData), readSamples);
+
             if (readSamples < needSamples)
             {
-                memset(pData + readSamples * sizeof(int16_t), 0, (needSamples - readSamples) * sizeof(int16_t));
+                fillSmoothSilence(reinterpret_cast<int16_t *>(pData), readSamples, needSamples);
                 silenceFillCount_++;
                 setBufferLow(true);
                 printf("[WASAPI] 填充静音: 需要 %zu 样本, 但只读到 %zu 样本，环缓余量 %zu\n", needSamples, readSamples, ringBuffer_->availableToRead());
             }
+
+            rememberLastSamples(reinterpret_cast<int16_t *>(pData), needSamples);
 
             pRenderClient_->ReleaseBuffer(framesAvailable, 0);
 
