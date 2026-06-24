@@ -17,6 +17,7 @@
 #include <thread>
 #include <vector>
 #include <functional>
+#include "time_stretcher.h"
 
 class WasapiRenderer {
 public:
@@ -76,5 +77,6 @@ private:
     int                     silenceFillCount_ = 0;
     std::atomic<uint32_t>   dropBaselineDurationMs_{0};
     std::atomic<uint32_t>   protectMs_{50};
-    double                  dropAccum_      = 0.0;
+    TimeStretcher           timeStretcher_;
+    std::vector<int16_t>    stretchInputBuf_;
 };

@@ -258,10 +258,10 @@ int main(int argc, char *argv[])
             printf("[System] 已启用丢弃乱序包模式\n");
         } else if (strcmp(argv[i], "--drop-baseline-duration-ms") == 0 && i + 1 < argc) {
             dropBaselineMs = (uint32_t)atoi(argv[++i]);
-            printf("[System] 丢弃率基准延迟: %u ms\n", dropBaselineMs);
+            printf("[System] 倍速追赶基准延迟: %u ms\n", dropBaselineMs);
         } else if (strcmp(argv[i], "--protect-ms") == 0 && i + 1 < argc) {
             protectMs = (uint32_t)atoi(argv[++i]);
-            printf("[System] 丢弃保护延迟: %u ms\n", protectMs);
+            printf("[System] 变速保护延迟: %u ms\n", protectMs);
         } else if (strcmp(argv[i], "--tcp") == 0 && i + 1 < argc) {
             g_tcpPort = (uint16_t)atoi(argv[++i]);
             printf("[System] TCP 端口已设置为 %u\n", g_tcpPort);

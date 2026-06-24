@@ -26,6 +26,7 @@ bool WasapiRenderer::init(uint32_t sampleRate, uint8_t channels, RingBuffer *rin
     sampleRate_ = sampleRate;
     channels_ = channels;
     ringBuffer_ = ringBuffer;
+    timeStretcher_.init(sampleRate, channels);
 
     hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE)
@@ -184,7 +185,8 @@ void WasapiRenderer::renderThread()
             // // ---------------------------
             // 感觉效果不行啊延迟是变低了稳定性有点烂
             
-            // --- 丢弃率自适应延迟控制 ---
+            // --- 保持音高的倍速延迟控制 ---
+            double targetSpeed = 1.0;
             uint32_t baseline = dropBaselineDurationMs_.load(std::memory_order_relaxed);
             if (baseline > 0)
             {
@@ -195,38 +197,44 @@ void WasapiRenderer::renderThread()
                 double x = (cachedMs - protect) / ((double)baseline);
                 if (x > 0.0)
                 {
-                    double r = 1.0 - 1.0 / std::exp(x * x * x * protect / (double)baseline);
-                    // r 是丢弃率：每 1/(1-r) 帧丢弃一帧，等价于每 1/r 帧额外丢弃一帧
-                    // 分母 N = 1/r，每处理一帧累加 r，累加满1时丢弃一整帧
-                    if (r > 0.0)
-                    {
-                        dropAccum_ += r * (double)framesAvailable;
-                        size_t framesToDrop = (size_t)dropAccum_;
-                        dropAccum_ -= (double)framesToDrop;
-                        if (framesToDrop > 0)
-                        {
-                            size_t samplesToDrop = framesToDrop * channels_;
-                            // 通过读取并丢弃来推进 tail
-                            static thread_local std::vector<int16_t> dropBuf;
-                            if (dropBuf.size() < samplesToDrop) dropBuf.resize(samplesToDrop);
-                            ringBuffer_->read(dropBuf.data(), samplesToDrop);
-                        }
-                    }
+                    // 旧逻辑的保留比例是 1 / exp(...)，等效播放速度就是 exp(...)。
+                    targetSpeed = std::exp(x * x * x * protect / (double)baseline);
                 }
             }
+            targetSpeed = std::clamp(targetSpeed, 0.25, 4.0);
+            timeStretcher_.setSpeed(targetSpeed);
             // ------------------------------------
 
             BYTE *pData = nullptr;
             pRenderClient_->GetBuffer(framesAvailable, &pData);
 
-            size_t readSamples = ringBuffer_->read(reinterpret_cast<int16_t *>(pData), (size_t)framesAvailable * channels_);
-
-            if (readSamples < (size_t)framesAvailable * channels_)
+            size_t needSamples = (size_t)framesAvailable * channels_;
+            size_t readSamples = 0;
+            if (baseline == 0)
             {
-                memset(pData + readSamples * sizeof(int16_t), 0, (framesAvailable * channels_ - readSamples) * sizeof(int16_t));
+                readSamples = ringBuffer_->read(reinterpret_cast<int16_t *>(pData), needSamples);
+            }
+            else
+            {
+                size_t feedSamples = (size_t)std::ceil((double)needSamples * targetSpeed) + (size_t)sampleRate_ * channels_ / 20;
+                feedSamples = std::min(feedSamples, ringBuffer_->availableToRead());
+                if (feedSamples > 0)
+                {
+                    if (stretchInputBuf_.size() < feedSamples)
+                        stretchInputBuf_.resize(feedSamples);
+                    size_t got = ringBuffer_->read(stretchInputBuf_.data(), feedSamples);
+                    timeStretcher_.appendInput(stretchInputBuf_.data(), got);
+                }
+
+                readSamples = timeStretcher_.readOutput(reinterpret_cast<int16_t *>(pData), needSamples);
+            }
+
+            if (readSamples < needSamples)
+            {
+                memset(pData + readSamples * sizeof(int16_t), 0, (needSamples - readSamples) * sizeof(int16_t));
                 silenceFillCount_++;
                 setBufferLow(true);
-                printf("[WASAPI] 填充静音: 需要 %u 样本, 但只读到 %zu 样本，环缓余量 %zu\n", framesAvailable * channels_, readSamples, ringBuffer_->availableToRead());
+                printf("[WASAPI] 填充静音: 需要 %zu 样本, 但只读到 %zu 样本，环缓余量 %zu\n", needSamples, readSamples, ringBuffer_->availableToRead());
             }
 
             pRenderClient_->ReleaseBuffer(framesAvailable, 0);

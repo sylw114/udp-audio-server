@@ -38,8 +38,8 @@ subbuild\audio_server_udp.exe [选项]
 | `--tcp` | `<端口>` | `9000` | TCP 监听端口 |
 | `--udp` | `<端口>` | `9000` | UDP 监听端口 |
 | `--discard-out-of-order` | - | 关闭 | 丢弃乱序包；默认会缓存并按序释放 |
-| `--drop-baseline-duration-ms` | `<ms>` | `0` | 自适应丢帧控制基准时长，`0` 表示禁用 |
-| `--protect-ms` | `<ms>` | `50` | 自适应丢帧保护窗口 |
+| `--drop-baseline-duration-ms` | `<ms>` | `0` | 自适应变速追赶基准时长，`0` 表示禁用 |
+| `--protect-ms` | `<ms>` | `50` | 自适应变速追赶保护窗口 |
 
 示例：
 
@@ -129,7 +129,7 @@ UDP 音频流 ─────────> main.cpp (UDP 主线程)
                         WasapiRenderer (渲染线程)
                         ├─ WASAPI 事件驱动
                         ├─ MMCSS "Pro Audio"
-                        ├─ 自适应丢帧延迟控制
+                        ├─ 保持音高的变速延迟控制
                         └─ 欠载时填充静音
 ```
 
@@ -140,21 +140,21 @@ UDP 音频流 ─────────> main.cpp (UDP 主线程)
 | `main.cpp` | 入口、CLI 解析、TCP 会话、UDP 接收、排序与生命周期管理 |
 | `protocol.h` | 协议结构、编码枚举、采样率映射、序号比较 |
 | `opus_decoder.h/cpp` | Opus 解码封装 |
-| `wasapi_renderer.h/cpp` | WASAPI 初始化、渲染线程、自适应丢帧算法 |
+| `wasapi_renderer.h/cpp` | WASAPI 初始化、渲染线程、自适应变速算法 |
 | `ring_buffer.h` | 无锁 SPSC 环形缓冲区，容量自动对齐至 2 的幂 |
 | `packet_queue.h` | 无锁包队列，当前未接入主流程 |
 | `CMakeLists.txt` | CMake 构建定义和 Opus FetchContent 配置 |
 
-## 自适应丢帧
+## 自适应变速
 
-当 `--drop-baseline-duration-ms > 0` 时启用。算法根据缓冲区积压量动态提高丢帧概率，以限制端到端延迟：
+当 `--drop-baseline-duration-ms > 0` 时启用。算法根据缓冲区积压量动态提高播放速度，以限制端到端延迟；服务端会在 PCM 进入 WASAPI 前做轻量 WSOLA 时间伸缩，改变时长但尽量保持音高不变。
 
 ```text
 x = (缓冲时长ms - protectMs) / baselineMs
-r = 1 - 1 / exp(x^3 * protectMs / baselineMs)   (x > 0 时)
+r = exp(x^3 * protectMs / baselineMs)   (x > 0 时)
 ```
 
-`r` 为每帧丢弃概率。缓冲时长不超过 `protectMs` 时不丢帧。
+`r` 为播放速度。缓冲时长不超过 `protectMs` 时按原速播放。
 
 ## 注意事项
 
@@ -166,5 +166,5 @@ r = 1 - 1 / exp(x^3 * protectMs / baselineMs)   (x > 0 时)
 
 ## 需要的帮助
 
-1. 当前丢帧更接近“跳帧倍速”，需要更自然的变速/时间伸缩算法。
+1. 当前时间伸缩是轻量实现，极端倍速下可继续优化音质或接入更专业的算法。
 2. 欠载时静音填充会影响听感，需要更好的预测或 PLC 策略。
