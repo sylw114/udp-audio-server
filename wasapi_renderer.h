@@ -17,7 +17,6 @@
 #include <thread>
 #include <vector>
 #include <functional>
-#include "time_stretcher.h"
 
 class WasapiRenderer {
 public:
@@ -58,6 +57,8 @@ private:
     void fadeInAfterSilence(int16_t* samples, size_t sampleCount);
     void fillSmoothSilence(int16_t* samples, size_t startSample, size_t totalSamples);
     void rememberLastSamples(const int16_t* samples, size_t sampleCount);
+    size_t renderResampled(int16_t* output, size_t outputSamples, double speed);
+    size_t bufferedSamples() const;
 
     HMODULE                 hRelinkDll_     = nullptr;
     IMMDeviceEnumerator*    pEnumerator_    = nullptr;
@@ -80,7 +81,6 @@ private:
     int                     silenceFillCount_ = 0;
     std::atomic<uint32_t>   dropBaselineDurationMs_{0};
     std::atomic<uint32_t>   protectMs_{50};
-    TimeStretcher           timeStretcher_;
     std::vector<int16_t>    stretchInputBuf_;
     std::vector<int16_t>    lastOutputSamples_;
     bool                    recoveringFromSilence_ = false;

@@ -20,7 +20,6 @@ add_executable(audio_server_udp
     main.cpp
     wasapi_renderer.cpp
     opus_decoder.cpp
-    time_stretcher.cpp
 )
 
 target_compile_features(audio_server_udp PRIVATE cxx_std_17)

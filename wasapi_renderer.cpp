@@ -26,7 +26,6 @@ bool WasapiRenderer::init(uint32_t sampleRate, uint8_t channels, RingBuffer *rin
     sampleRate_ = sampleRate;
     channels_ = channels;
     ringBuffer_ = ringBuffer;
-    timeStretcher_.init(sampleRate, channels);
     lastOutputSamples_.assign(channels, 0);
     recoveringFromSilence_ = false;
 
@@ -167,6 +166,53 @@ void WasapiRenderer::rememberLastSamples(const int16_t* samples, size_t sampleCo
         lastOutputSamples_[ch] = samples[lastFrame * channels_ + ch];
 }
 
+size_t WasapiRenderer::renderResampled(int16_t* output, size_t outputSamples, double speed)
+{
+    if (!output || channels_ == 0 || outputSamples < channels_)
+        return 0;
+
+    size_t outputFrames = outputSamples / channels_;
+    size_t availableFrames = ringBuffer_->availableToRead() / channels_;
+    if (outputFrames == 0 || availableFrames == 0)
+        return 0;
+
+    size_t targetInputFrames = (size_t)std::ceil((double)outputFrames * speed);
+    targetInputFrames = std::clamp<size_t>(targetInputFrames, 1, availableFrames);
+    size_t inputSamples = targetInputFrames * channels_;
+
+    if (stretchInputBuf_.size() < inputSamples)
+        stretchInputBuf_.resize(inputSamples);
+    size_t gotSamples = ringBuffer_->read(stretchInputBuf_.data(), inputSamples);
+    size_t gotFrames = gotSamples / channels_;
+    if (gotFrames == 0)
+        return 0;
+
+    double actualSpeed = (double)gotFrames / (double)outputFrames;
+    for (size_t frame = 0; frame < outputFrames; ++frame)
+    {
+        double srcPos = (double)frame * actualSpeed;
+        size_t i0 = (size_t)srcPos;
+        if (i0 >= gotFrames)
+            i0 = gotFrames - 1;
+        size_t i1 = std::min(i0 + 1, gotFrames - 1);
+        double frac = srcPos - (double)i0;
+
+        for (uint8_t ch = 0; ch < channels_; ++ch)
+        {
+            double a = (double)stretchInputBuf_[i0 * channels_ + ch];
+            double b = (double)stretchInputBuf_[i1 * channels_ + ch];
+            output[frame * channels_ + ch] = (int16_t)std::lrint(a + (b - a) * frac);
+        }
+    }
+
+    return outputFrames * channels_;
+}
+
+size_t WasapiRenderer::bufferedSamples() const
+{
+    return ringBuffer_ ? ringBuffer_->availableToRead() : 0;
+}
+
 bool WasapiRenderer::start()
 {
     if (running_.load())
@@ -253,11 +299,11 @@ void WasapiRenderer::renderThread()
             // --- 保持音高的倍速延迟控制 ---
             double targetSpeed = 1.0;
             uint32_t baseline = dropBaselineDurationMs_.load(std::memory_order_relaxed);
+            size_t bufferedBeforeRead = bufferedSamples();
             if (baseline > 0)
             {
-                size_t availSamples = ringBuffer_->availableToRead();
                 // 缓存时长 ms = 可读样本数 / (采样率 * 声道数) * 1000
-                double cachedMs = (double)availSamples / (sampleRate_ * channels_) * 1000.0;
+                double cachedMs = (double)bufferedBeforeRead / (sampleRate_ * channels_) * 1000.0;
                 double protect = (double)protectMs_.load(std::memory_order_relaxed);
                 double x = (cachedMs - protect) / ((double)baseline);
                 if (x > 0.0)
@@ -267,7 +313,6 @@ void WasapiRenderer::renderThread()
                 }
             }
             targetSpeed = std::clamp(targetSpeed, 0.25, 4.0);
-            timeStretcher_.setSpeed(targetSpeed);
             // ------------------------------------
 
             BYTE *pData = nullptr;
@@ -281,17 +326,7 @@ void WasapiRenderer::renderThread()
             }
             else
             {
-                size_t feedSamples = (size_t)std::ceil((double)needSamples * targetSpeed) + (size_t)sampleRate_ * channels_ / 20;
-                feedSamples = std::min(feedSamples, ringBuffer_->availableToRead());
-                if (feedSamples > 0)
-                {
-                    if (stretchInputBuf_.size() < feedSamples)
-                        stretchInputBuf_.resize(feedSamples);
-                    size_t got = ringBuffer_->read(stretchInputBuf_.data(), feedSamples);
-                    timeStretcher_.appendInput(stretchInputBuf_.data(), got);
-                }
-
-                readSamples = timeStretcher_.readOutput(reinterpret_cast<int16_t *>(pData), needSamples);
+                readSamples = renderResampled(reinterpret_cast<int16_t *>(pData), needSamples, targetSpeed);
             }
 
             if (readSamples > 0)
@@ -302,7 +337,7 @@ void WasapiRenderer::renderThread()
                 fillSmoothSilence(reinterpret_cast<int16_t *>(pData), readSamples, needSamples);
                 silenceFillCount_++;
                 setBufferLow(true);
-                printf("[WASAPI] 填充静音: 需要 %zu 样本, 但只读到 %zu 样本，环缓余量 %zu\n", needSamples, readSamples, ringBuffer_->availableToRead());
+                printf("[WASAPI] 填充静音: 需要 %zu 样本, 但只读到 %zu 样本，播放余量 %zu\n", needSamples, readSamples, bufferedSamples());
             }
 
             rememberLastSamples(reinterpret_cast<int16_t *>(pData), needSamples);
@@ -311,7 +346,7 @@ void WasapiRenderer::renderThread()
 
             if ((++renderCount_ % 1000) == 0)
             {
-                printf("[WASAPI] 渲染状态: bufferFrames=%u, padding=%u, 填充静音次数=%d, ringBuffer.availableToRead=%zu\n", bufferFrames_, padding, silenceFillCount_, ringBuffer_->availableToRead());
+                printf("[WASAPI] 渲染状态: bufferFrames=%u, padding=%u, 填充静音次数=%d, 播放余量=%zu\n", bufferFrames_, padding, silenceFillCount_, bufferedSamples());
             }
         }
     }
