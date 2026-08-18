@@ -24,6 +24,7 @@ public:
     bool init(uint32_t sampleRate, uint8_t channels, uint8_t frameMs);
     void reset();
     bool decode(const uint8_t* data, size_t length, std::vector<int16_t>& pcm);
+    bool decodeLoss(std::vector<int16_t>& pcm);
 
 private:
     OpusDecoder* decoder_ = nullptr;

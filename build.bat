@@ -3,6 +3,15 @@ REM ============================================================================
 REM build.bat - UDP C++ Audio Server CMake Build Script
 REM ============================================================================
 
+REM MSBuild treats Path and PATH as duplicate environment variables. Some managed
+REM terminals expose both spellings, so relaunch once with a canonical Path key.
+if defined LIVESUITE_BUILD_ENV_NORMALIZED goto :environment_normalized
+set "LIVESUITE_BUILD_SCRIPT=%~f0"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$pathValue = [Environment]::GetEnvironmentVariable('Path', 'Process'); [Environment]::SetEnvironmentVariable('PATH', $null, 'Process'); [Environment]::SetEnvironmentVariable('Path', $pathValue, 'Process'); $env:LIVESUITE_BUILD_ENV_NORMALIZED = '1'; & $env:LIVESUITE_BUILD_SCRIPT; exit $LASTEXITCODE"
+exit /b %ERRORLEVEL%
+
+:environment_normalized
+
 setlocal enabledelayedexpansion
 
 echo ========================================
@@ -16,11 +25,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
-set "BUILD_DIR=build\cmake-msvc"
-set "DIST_DIR=subbuild"
+set "SOURCE_DIR=%~dp0."
+set "BUILD_DIR=%~dp0build\cmake-msvc"
+set "DIST_DIR=%~dp0subbuild"
 
 echo [INFO] Configuring CMake...
-cmake -S . -B "%BUILD_DIR%" -A x64 -DCMAKE_INSTALL_PREFIX="%CD%\%DIST_DIR%"
+cmake -S "%SOURCE_DIR%" -B "%BUILD_DIR%" -A x64 -DCMAKE_INSTALL_PREFIX="%DIST_DIR%"
 if errorlevel 1 (
     echo.
     echo [ERROR] CMake configure failed!

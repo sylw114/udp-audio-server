@@ -61,3 +61,21 @@ bool OpusDecoderRuntime::decode(const uint8_t* data, size_t length, std::vector<
     pcm.resize((size_t)decodedFrames * channels_);
     return true;
 }
+
+bool OpusDecoderRuntime::decodeLoss(std::vector<int16_t>& pcm)
+{
+    if (!decoder_)
+        return false;
+
+    pcm.resize((size_t)frameSamples_ * channels_);
+    int decodedFrames = opus_decode(decoder_, nullptr, 0, pcm.data(), frameSamples_, 0);
+    if (decodedFrames < 0)
+    {
+        printf("[Opus] 丢包隐藏失败: %d\n", decodedFrames);
+        pcm.clear();
+        return false;
+    }
+
+    pcm.resize((size_t)decodedFrames * channels_);
+    return true;
+}

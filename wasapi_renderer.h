@@ -48,6 +48,7 @@ public:
     void setBufferLow(bool low) { bufferLow_.store(low, std::memory_order_relaxed); }
     void setDropBaseline(uint32_t ms) { dropBaselineDurationMs_.store(ms, std::memory_order_relaxed); }
     void setProtect(uint32_t ms) { protectMs_.store(ms, std::memory_order_relaxed); }
+    void setMaxSpeed(double speed);
 
     // 渲染线程致命超时回调（由主线程设置，触发 TCP 断连）
     std::function<void()> onFatalTimeout;
@@ -57,7 +58,8 @@ private:
     void fadeInAfterSilence(int16_t* samples, size_t sampleCount);
     void fillSmoothSilence(int16_t* samples, size_t startSample, size_t totalSamples);
     void rememberLastSamples(const int16_t* samples, size_t sampleCount);
-    size_t renderResampled(int16_t* output, size_t outputSamples, double speed);
+    size_t renderPitchPreserved(int16_t* output, size_t outputSamples, double speed);
+    size_t findSmoothSkip(size_t inputFrames, size_t skipFrames, size_t fadeFrames) const;
     size_t bufferedSamples() const;
 
     HMODULE                 hRelinkDll_     = nullptr;
@@ -81,7 +83,9 @@ private:
     int                     silenceFillCount_ = 0;
     std::atomic<uint32_t>   dropBaselineDurationMs_{0};
     std::atomic<uint32_t>   protectMs_{50};
+    std::atomic<uint32_t>   maxSpeedPermille_{1250};
     std::vector<int16_t>    stretchInputBuf_;
     std::vector<int16_t>    lastOutputSamples_;
+    double                  currentSpeed_ = 1.0;
     bool                    recoveringFromSilence_ = false;
 };

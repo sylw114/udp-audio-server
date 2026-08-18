@@ -16,10 +16,34 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(opus)
 
+find_program(CARGO_EXECUTABLE cargo REQUIRED)
+set(QUIC_BRIDGE_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/quic-bridge/Cargo.toml")
+set(QUIC_BRIDGE_TARGET_DIR "${CMAKE_BINARY_DIR}/cargo-target")
+set(QUIC_BRIDGE_DLL "${QUIC_BRIDGE_TARGET_DIR}/release/livesuite_audio_quic.dll")
+
+add_custom_target(livesuite_audio_quic_bridge ALL
+    COMMAND ${CMAKE_COMMAND} -E env
+        "CARGO_TARGET_DIR=${QUIC_BRIDGE_TARGET_DIR}"
+        ${CARGO_EXECUTABLE} build --release --manifest-path "${QUIC_BRIDGE_MANIFEST}"
+    BYPRODUCTS "${QUIC_BRIDGE_DLL}"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/quic-bridge"
+    COMMENT "Building LiveSuite audio QUIC bridge"
+    VERBATIM
+)
+
 add_executable(audio_server_udp
     main.cpp
     wasapi_renderer.cpp
     opus_decoder.cpp
+    quic_audio_receiver.cpp
+)
+
+add_dependencies(audio_server_udp livesuite_audio_quic_bridge)
+
+add_custom_command(TARGET audio_server_udp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${QUIC_BRIDGE_DLL}"
+        "$<TARGET_FILE_DIR:audio_server_udp>/livesuite_audio_quic.dll"
 )
 
 target_compile_features(audio_server_udp PRIVATE cxx_std_17)
@@ -44,6 +68,11 @@ target_link_libraries(audio_server_udp PRIVATE
 
 install(TARGETS audio_server_udp
     RUNTIME DESTINATION .
+    COMPONENT runtime
+)
+
+install(FILES "${QUIC_BRIDGE_DLL}"
+    DESTINATION .
     COMPONENT runtime
 )
 

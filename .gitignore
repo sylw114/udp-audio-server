@@ -1,6 +1,8 @@
 # 构建产物
 /build/
+/quic-bridge/target/
 /subbuild/*.exe
+/subbuild/*.dll
 /subbuild/*.pdb
 /subbuild/*.ilk
 *.obj

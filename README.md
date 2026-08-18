@@ -40,11 +40,12 @@ subbuild\audio_server_udp.exe [选项]
 | `--discard-out-of-order` | - | 关闭 | 丢弃乱序包；默认会缓存并按序释放 |
 | `--drop-baseline-duration-ms` | `<ms>` | `0` | 自适应变速追赶基准时长，`0` 表示禁用 |
 | `--protect-ms` | `<ms>` | `50` | 自适应变速追赶保护窗口 |
+| `--max-speed` | `<倍速>` | `1.25` | 自适应追赶的播放速度上限 |
 
 示例：
 
 ```bat
-subbuild\audio_server_udp.exe --tcp 9000 --udp 9000 --drop-baseline-duration-ms 120 --protect-ms 50
+subbuild\audio_server_udp.exe --tcp 9000 --udp 9000 --drop-baseline-duration-ms 120 --protect-ms 50 --max-speed 1.25
 ```
 
 ## 协议
@@ -147,14 +148,14 @@ UDP 音频流 ─────────> main.cpp (UDP 主线程)
 
 ## 自适应变速
 
-当 `--drop-baseline-duration-ms > 0` 时启用。算法根据缓冲区积压量动态提高播放速度，以限制端到端延迟；服务端会在 PCM 进入 WASAPI 前做轻量 WSOLA 时间伸缩，改变时长但尽量保持音高不变。
+当 `--drop-baseline-duration-ms > 0` 时启用。算法根据缓冲区积压量动态提高播放速度，以限制端到端延迟；服务端会在 PCM 进入 WASAPI 前预估本轮需要额外消耗的输入帧，只读取这段候选数据，并通过时域跳接 + 交叉淡化缩短时长，尽量保持音高不变。
 
 ```text
 x = (缓冲时长ms - protectMs) / baselineMs
 r = exp(x^3 * protectMs / baselineMs)   (x > 0 时)
 ```
 
-`r` 为播放速度。缓冲时长不超过 `protectMs` 时按原速播放。
+`r` 为目标播放速度，最终会被 `--max-speed` 限制；渲染线程还会限制单次回调的速度爬升幅度，减少连续块之间的突变。缓冲时长不超过 `protectMs` 时按原速播放。
 
 ## 注意事项
 
@@ -166,5 +167,5 @@ r = exp(x^3 * protectMs / baselineMs)   (x > 0 时)
 
 ## 需要的帮助
 
-1. 当前时间伸缩是轻量实现，极端倍速下可继续优化音质或接入更专业的算法。
-2. 欠载时静音填充会影响听感，需要更好的预测或 PLC 策略。
+1. 当前时间伸缩是轻量时域实现，极端倍速或复杂音乐下可继续优化为更完整的 WSOLA/PSOLA。
+2. 欠载时静音填充已做淡出/淡入，后续仍可结合 Opus PLC 或历史波形预测改善听感。

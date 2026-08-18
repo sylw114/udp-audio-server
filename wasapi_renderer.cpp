@@ -9,6 +9,8 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <cstdlib>
+#include <cstdint>
 
 #define SAFE_RELEASE(p)     \
     do                      \
@@ -28,6 +30,7 @@ bool WasapiRenderer::init(uint32_t sampleRate, uint8_t channels, RingBuffer *rin
     ringBuffer_ = ringBuffer;
     lastOutputSamples_.assign(channels, 0);
     recoveringFromSilence_ = false;
+    currentSpeed_ = 1.0;
 
     hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE)
@@ -103,6 +106,20 @@ bool WasapiRenderer::init(uint32_t sampleRate, uint8_t channels, RingBuffer *rin
     return true;
 }
 
+void WasapiRenderer::setMaxSpeed(double speed)
+{
+    if (!std::isfinite(speed))
+        speed = 1.0;
+    speed = std::clamp(speed, 1.0, 4.0);
+    maxSpeedPermille_.store((uint32_t)std::lrint(speed * 1000.0), std::memory_order_relaxed);
+}
+
+static double smoothStep(double x)
+{
+    x = std::clamp(x, 0.0, 1.0);
+    return x * x * (3.0 - 2.0 * x);
+}
+
 void WasapiRenderer::fadeInAfterSilence(int16_t* samples, size_t sampleCount)
 {
     if (!recoveringFromSilence_ || channels_ == 0 || sampleCount == 0)
@@ -112,12 +129,11 @@ void WasapiRenderer::fadeInAfterSilence(int16_t* samples, size_t sampleCount)
     size_t fadeFrames = std::min(frameCount, (size_t)std::max<uint32_t>(1, sampleRate_ / 200));
     for (size_t frame = 0; frame < fadeFrames; ++frame)
     {
-        int32_t gain = (int32_t)(frame + 1);
-        int32_t denom = (int32_t)fadeFrames;
+        double gain = smoothStep((double)(frame + 1) / (double)fadeFrames);
         for (uint8_t ch = 0; ch < channels_; ++ch)
         {
             size_t index = frame * channels_ + ch;
-            samples[index] = (int16_t)((int32_t)samples[index] * gain / denom);
+            samples[index] = (int16_t)std::lrint((double)samples[index] * gain);
         }
     }
 
@@ -136,8 +152,7 @@ void WasapiRenderer::fillSmoothSilence(int16_t* samples, size_t startSample, siz
 
     for (size_t frame = 0; frame < fillFrames; ++frame)
     {
-        int32_t gain = frame < fadeFrames ? (int32_t)(fadeFrames - frame) : 0;
-        int32_t denom = (int32_t)fadeFrames;
+        double gain = frame < fadeFrames ? (1.0 - smoothStep((double)(frame + 1) / (double)fadeFrames)) : 0.0;
         for (uint8_t ch = 0; ch < channels_; ++ch)
         {
             int16_t start = 0;
@@ -147,7 +162,7 @@ void WasapiRenderer::fillSmoothSilence(int16_t* samples, size_t startSample, siz
                 start = lastOutputSamples_[ch];
 
             size_t index = (startFrame + frame) * channels_ + ch;
-            samples[index] = frame < fadeFrames ? (int16_t)((int32_t)start * gain / denom) : 0;
+            samples[index] = frame < fadeFrames ? (int16_t)std::lrint((double)start * gain) : 0;
         }
     }
 
@@ -166,7 +181,42 @@ void WasapiRenderer::rememberLastSamples(const int16_t* samples, size_t sampleCo
         lastOutputSamples_[ch] = samples[lastFrame * channels_ + ch];
 }
 
-size_t WasapiRenderer::renderResampled(int16_t* output, size_t outputSamples, double speed)
+size_t WasapiRenderer::findSmoothSkip(size_t inputFrames, size_t skipFrames, size_t fadeFrames) const
+{
+    if (channels_ == 0 || inputFrames <= skipFrames + fadeFrames)
+        return 0;
+
+    size_t maxStart = inputFrames - skipFrames - fadeFrames;
+    size_t bestStart = maxStart / 2;
+    uint64_t bestScore = UINT64_MAX;
+    size_t step = std::max<size_t>(1, fadeFrames / 32);
+
+    for (size_t start = 0; start <= maxStart; ++start)
+    {
+        uint64_t score = 0;
+        for (size_t frame = 0; frame < fadeFrames; frame += step)
+        {
+            size_t leftFrame = start + frame;
+            size_t rightFrame = start + skipFrames + frame;
+            for (uint8_t ch = 0; ch < channels_; ++ch)
+            {
+                int32_t a = stretchInputBuf_[leftFrame * channels_ + ch];
+                int32_t b = stretchInputBuf_[rightFrame * channels_ + ch];
+                score += (uint64_t)std::abs(a - b);
+            }
+        }
+
+        if (score < bestScore)
+        {
+            bestScore = score;
+            bestStart = start;
+        }
+    }
+
+    return bestStart;
+}
+
+size_t WasapiRenderer::renderPitchPreserved(int16_t* output, size_t outputSamples, double speed)
 {
     if (!output || channels_ == 0 || outputSamples < channels_)
         return 0;
@@ -176,36 +226,70 @@ size_t WasapiRenderer::renderResampled(int16_t* output, size_t outputSamples, do
     if (outputFrames == 0 || availableFrames == 0)
         return 0;
 
+    speed = std::clamp(speed, 1.0, (double)maxSpeedPermille_.load(std::memory_order_relaxed) / 1000.0);
+    if (speed <= 1.001 || availableFrames <= outputFrames)
+        return ringBuffer_->read(output, std::min(outputFrames, availableFrames) * channels_);
+
+    // 预估本轮需要多消耗的帧，只对这段候选数据做时间压缩。
     size_t targetInputFrames = (size_t)std::ceil((double)outputFrames * speed);
-    targetInputFrames = std::clamp<size_t>(targetInputFrames, 1, availableFrames);
+    targetInputFrames = std::clamp<size_t>(targetInputFrames, outputFrames, availableFrames);
+    size_t skipFrames = targetInputFrames - outputFrames;
+    if (skipFrames == 0)
+        return ringBuffer_->read(output, outputSamples);
+
     size_t inputSamples = targetInputFrames * channels_;
 
     if (stretchInputBuf_.size() < inputSamples)
         stretchInputBuf_.resize(inputSamples);
     size_t gotSamples = ringBuffer_->read(stretchInputBuf_.data(), inputSamples);
     size_t gotFrames = gotSamples / channels_;
-    if (gotFrames == 0)
-        return 0;
-
-    double actualSpeed = (double)gotFrames / (double)outputFrames;
-    for (size_t frame = 0; frame < outputFrames; ++frame)
+    if (gotFrames <= outputFrames)
     {
-        double srcPos = (double)frame * actualSpeed;
-        size_t i0 = (size_t)srcPos;
-        if (i0 >= gotFrames)
-            i0 = gotFrames - 1;
-        size_t i1 = std::min(i0 + 1, gotFrames - 1);
-        double frac = srcPos - (double)i0;
+        memcpy(output, stretchInputBuf_.data(), gotSamples * sizeof(int16_t));
+        return gotSamples;
+    }
 
+    skipFrames = gotFrames - outputFrames;
+    size_t fadeFrames = std::min<size_t>(std::max<uint32_t>(1, sampleRate_ / 500), outputFrames / 4);
+    fadeFrames = std::min(fadeFrames, gotFrames - skipFrames);
+    if (fadeFrames < 2 || gotFrames <= skipFrames + fadeFrames)
+    {
+        memcpy(output, stretchInputBuf_.data(), outputSamples * sizeof(int16_t));
+        return outputSamples;
+    }
+
+    size_t skipStart = findSmoothSkip(gotFrames, skipFrames, fadeFrames);
+    size_t outFrame = 0;
+
+    for (size_t frame = 0; frame < skipStart && outFrame < outputFrames; ++frame, ++outFrame)
+    {
+        for (uint8_t ch = 0; ch < channels_; ++ch)
+            output[outFrame * channels_ + ch] = stretchInputBuf_[frame * channels_ + ch];
+    }
+
+    for (size_t frame = 0; frame < fadeFrames && outFrame < outputFrames; ++frame, ++outFrame)
+    {
+        double t = smoothStep((double)(frame + 1) / (double)(fadeFrames + 1));
+        size_t leftFrame = skipStart + frame;
+        size_t rightFrame = skipStart + skipFrames + frame;
         for (uint8_t ch = 0; ch < channels_; ++ch)
         {
-            double a = (double)stretchInputBuf_[i0 * channels_ + ch];
-            double b = (double)stretchInputBuf_[i1 * channels_ + ch];
-            output[frame * channels_ + ch] = (int16_t)std::lrint(a + (b - a) * frac);
+            double a = (double)stretchInputBuf_[leftFrame * channels_ + ch];
+            double b = (double)stretchInputBuf_[rightFrame * channels_ + ch];
+            output[outFrame * channels_ + ch] = (int16_t)std::lrint(a + (b - a) * t);
         }
     }
 
-    return outputFrames * channels_;
+    size_t srcFrame = skipStart + skipFrames + fadeFrames;
+    while (outFrame < outputFrames && srcFrame < gotFrames)
+    {
+        for (uint8_t ch = 0; ch < channels_; ++ch)
+            output[outFrame * channels_ + ch] = stretchInputBuf_[srcFrame * channels_ + ch];
+        ++outFrame;
+        ++srcFrame;
+    }
+
+    return outFrame * channels_;
 }
 
 size_t WasapiRenderer::bufferedSamples() const
@@ -312,7 +396,12 @@ void WasapiRenderer::renderThread()
                     targetSpeed = std::exp(x * x * x * protect / (double)baseline);
                 }
             }
-            targetSpeed = std::clamp(targetSpeed, 0.25, 4.0);
+            double maxSpeed = (double)maxSpeedPermille_.load(std::memory_order_relaxed) / 1000.0;
+            targetSpeed = std::clamp(targetSpeed, 1.0, maxSpeed);
+            if (targetSpeed > currentSpeed_)
+                currentSpeed_ = std::min(targetSpeed, currentSpeed_ + 0.02);
+            else
+                currentSpeed_ = targetSpeed;
             // ------------------------------------
 
             BYTE *pData = nullptr;
@@ -326,7 +415,7 @@ void WasapiRenderer::renderThread()
             }
             else
             {
-                readSamples = renderResampled(reinterpret_cast<int16_t *>(pData), needSamples, targetSpeed);
+                readSamples = renderPitchPreserved(reinterpret_cast<int16_t *>(pData), needSamples, currentSpeed_);
             }
 
             if (readSamples > 0)

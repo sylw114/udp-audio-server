@@ -1,5 +1,5 @@
 // ============================================================================
-// main.cpp — UDP 低延迟音频直通服务器
+// main.cpp — QUIC/UDP 低延迟音频直通服务器
 // ============================================================================
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -21,11 +21,13 @@
 #include <mutex>
 #include <atomic>
 #include <algorithm>
+#include <string>
 
 #include "protocol.h"
 #include "ring_buffer.h"
 #include "wasapi_renderer.h"
 #include "opus_decoder.h"
+#include "quic_audio_receiver.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "ole32.lib")
@@ -44,6 +46,13 @@ static uint8_t g_channels = 2;
 static uint8_t g_codec = AUDIO_CODEC_PCM;
 static uint8_t g_frameMs = 20;
 static uint8_t g_opusBitrateKbps = 32;
+static QuicAudioReceiver *g_quicReceiver = nullptr;
+
+enum class AudioTransportMode
+{
+    Quic,
+    Udp,
+};
 
 // 每个序号最早到达时间（ms），0 表示未到达；由 UDP 主线程写，TCP 线程读
 static std::atomic<uint64_t> g_seqTimestamps[256];
@@ -63,6 +72,27 @@ static void closeTcpClient()
     }
 }
 
+static void applyQuicConfig(const QuicAudioEvent &event)
+{
+    std::lock_guard<std::mutex> lock(g_configMutex);
+    g_sampleRate = event.sampleRate;
+    g_channels = event.channels;
+    g_codec = event.codec;
+    g_frameMs = event.frameMs;
+    g_opusBitrateKbps = (uint8_t)std::min<uint32_t>(event.bitrate / 1000, 255);
+    g_configReady = true;
+    printf("[QUIC] 收到配置: %u Hz, 声道: %u, 编码: %s, 帧长: %u ms, 码率: %u kbps\n",
+           g_sampleRate, g_channels,
+           g_codec == AUDIO_CODEC_PCM ? "PCM" : "Opus",
+           g_frameMs, g_opusBitrateKbps);
+}
+
+static void clearActiveConfig()
+{
+    std::lock_guard<std::mutex> lock(g_configMutex);
+    g_configReady = false;
+}
+
 static void signalHandler(int sig)
 {
     (void)sig;
@@ -80,6 +110,8 @@ static void signalHandler(int sig)
         closesocket(g_tcpSocket);
         g_tcpSocket = INVALID_SOCKET;
     }
+    if (g_quicReceiver)
+        g_quicReceiver->disconnectClient();
 }
 
 #pragma pack(push, 1)
@@ -252,6 +284,8 @@ int main(int argc, char *argv[])
     bool discardOutOfOrder = false;
     uint32_t dropBaselineMs = 0;
     uint32_t protectMs = 50;
+    double maxSpeed = 1.25;
+    AudioTransportMode transportMode = AudioTransportMode::Quic;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--discard-out-of-order") == 0) {
             discardOutOfOrder = true;
@@ -262,12 +296,27 @@ int main(int argc, char *argv[])
         } else if (strcmp(argv[i], "--protect-ms") == 0 && i + 1 < argc) {
             protectMs = (uint32_t)atoi(argv[++i]);
             printf("[System] 变速保护延迟: %u ms\n", protectMs);
+        } else if (strcmp(argv[i], "--max-speed") == 0 && i + 1 < argc) {
+            maxSpeed = std::clamp(atof(argv[++i]), 1.0, 4.0);
+            printf("[System] 变速速度上限: %.2fx\n", maxSpeed);
         } else if (strcmp(argv[i], "--tcp") == 0 && i + 1 < argc) {
             g_tcpPort = (uint16_t)atoi(argv[++i]);
             printf("[System] TCP 端口已设置为 %u\n", g_tcpPort);
         } else if (strcmp(argv[i], "--udp") == 0 && i + 1 < argc) {
             g_udpPort = (uint16_t)atoi(argv[++i]);
-            printf("[System] UDP 端口已设置为 %u\n", g_udpPort);
+            printf("[System] 音频数据端口已设置为 %u\n", g_udpPort);
+        } else if (strcmp(argv[i], "--transport") == 0 && i + 1 < argc) {
+            std::string value = argv[++i];
+            std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+            if (value == "udp")
+                transportMode = AudioTransportMode::Udp;
+            else if (value == "quic")
+                transportMode = AudioTransportMode::Quic;
+            else
+            {
+                printf("[System] 不支持的音频传输: %s（可选 quic/udp）\n", value.c_str());
+                return 1;
+            }
         }
     }
 
@@ -276,18 +325,35 @@ int main(int argc, char *argv[])
 
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
-    std::thread tcpThread(tcpHandler);
-
-    g_udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    std::thread tcpThread;
     sockaddr_in addr = {AF_INET};
     addr.sin_port = htons(g_udpPort);
-    if (bind(g_udpSocket, (sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR)
+    QuicAudioReceiver quicReceiver;
+    if (transportMode == AudioTransportMode::Udp)
     {
-        printf("[UDP] 绑定端口 %u 失败，端口可能被占用 (错误码: %d)\n", g_udpPort, WSAGetLastError());
-        closesocket(g_udpSocket);
-        closesocket(g_tcpSocket);
-        WSACleanup();
-        exit(1);
+        printf("[System] 音频传输: UDP（TCP 控制端口 %u，UDP 数据端口 %u）\n", g_tcpPort, g_udpPort);
+        tcpThread = std::thread(tcpHandler);
+        g_udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (bind(g_udpSocket, (sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR)
+        {
+            printf("[UDP] 绑定端口 %u 失败，端口可能被占用 (错误码: %d)\n", g_udpPort, WSAGetLastError());
+            closesocket(g_udpSocket);
+            closesocket(g_tcpSocket);
+            WSACleanup();
+            exit(1);
+        }
+    }
+    else
+    {
+        printf("[System] 音频传输: QUIC Stream（端口 %u）\n", g_udpPort);
+        g_quicReceiver = &quicReceiver;
+        if (!quicReceiver.start(g_udpPort))
+        {
+            printf("[QUIC] 启动失败: %s\n", quicReceiver.lastError().c_str());
+            g_quicReceiver = nullptr;
+            WSACleanup();
+            return 1;
+        }
     }
 
     WasapiRenderer renderer;
@@ -303,9 +369,12 @@ int main(int argc, char *argv[])
     printf("[Server] 等待客户端配置...\n");
 
     // 渲染线程超时 → 关闭 TCP 客户端连接 → tcpHandler 检测到断开 → 走清理路径
-    renderer.onFatalTimeout = []() {
-        printf("[WASAPI] 渲染线程超时，关闭 TCP 客户端连接以触发清理\n");
-        closeTcpClient();
+    renderer.onFatalTimeout = [&]() {
+        printf("[WASAPI] 渲染线程超时，断开当前音频客户端以触发清理\n");
+        if (transportMode == AudioTransportMode::Quic)
+            quicReceiver.disconnectClient();
+        else
+            closeTcpClient();
     };
 
     uint8_t recvBuf[65536];
@@ -333,6 +402,26 @@ int main(int argc, char *argv[])
 
     while (g_running)
     {
+        if (transportMode == AudioTransportMode::Quic && !initialized)
+        {
+            QuicAudioEvent event = {};
+            int result = quicReceiver.receive(event, recvBuf, sizeof(recvBuf), 100);
+            if (result < 0)
+            {
+                printf("[QUIC] 接收桥失败: %s\n", quicReceiver.lastError().c_str());
+                Sleep(100);
+            }
+            else if (result > 0)
+            {
+                if (event.kind == QUIC_AUDIO_EVENT_CONFIG)
+                    applyQuicConfig(event);
+                else if (event.kind == QUIC_AUDIO_EVENT_DISCONNECTED)
+                    clearActiveConfig();
+                else if (event.kind == QUIC_AUDIO_EVENT_ERROR)
+                    printf("[QUIC] %s\n", quicReceiver.lastError().c_str());
+            }
+        }
+
         bool configReady;
         uint32_t sr;
         uint8_t ch;
@@ -360,6 +449,7 @@ int main(int argc, char *argv[])
                 renderer.start();
                 renderer.setDropBaseline(dropBaselineMs);
                 renderer.setProtect(protectMs);
+                renderer.setMaxSpeed(maxSpeed);
                 initialized = true;
                 activeCodec = codec;
                 expectedSeq = 0;
@@ -376,13 +466,16 @@ int main(int argc, char *argv[])
                 opusDecoder.reset();
                 delete ringBuffer;
                 ringBuffer = nullptr;
-                closeTcpClient();
+                if (transportMode == AudioTransportMode::Quic)
+                    quicReceiver.disconnectClient();
+                else
+                    closeTcpClient();
                 Sleep(1000);
             }
         }
         else if (!configReady && initialized)
         {
-            printf("[Server] TCP 连接断开，停止渲染\n");
+            printf("[Server] 音频连接断开，停止渲染\n");
             renderer.stop();
             opusDecoder.reset();
             delete ringBuffer;
@@ -392,8 +485,8 @@ int main(int argc, char *argv[])
 
         if (!initialized)
         {
-            // 若 UDP socket 已被关闭（TCP 断开导致），重新创建以等待新客户端
-            if (g_udpSocket == INVALID_SOCKET)
+            // 旧协议中 TCP 断开会关闭 UDP socket，需要重新创建等待下一个客户端。
+            if (transportMode == AudioTransportMode::Udp && g_udpSocket == INVALID_SOCKET)
             {
                 g_udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
                 if (g_udpSocket != INVALID_SOCKET)
@@ -403,17 +496,74 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        // --- 等待数据（阻塞直到有数据到达） ---
-        int bytesReceived = recvfrom(g_udpSocket, (char *)recvBuf, sizeof(recvBuf), 0, (sockaddr *)&clientAddr, &clientLen);
+        // --- 等待媒体数据 ---
+        int bytesReceived = 0;
+        uint8_t seq = 0;
+        const uint8_t *audioData = nullptr;
+        size_t audioLen = 0;
+        if (transportMode == AudioTransportMode::Quic)
+        {
+            QuicAudioEvent event = {};
+            int result = quicReceiver.receive(event, recvBuf, sizeof(recvBuf), 100);
+            if (result <= 0)
+            {
+                if (result < 0)
+                    printf("[QUIC] 接收桥失败: %s\n", quicReceiver.lastError().c_str());
+                continue;
+            }
+            if (event.kind == QUIC_AUDIO_EVENT_CONFIG)
+            {
+                applyQuicConfig(event);
+                continue;
+            }
+            if (event.kind == QUIC_AUDIO_EVENT_DISCONNECTED)
+            {
+                clearActiveConfig();
+                continue;
+            }
+            if (event.kind == QUIC_AUDIO_EVENT_ERROR)
+            {
+                printf("[QUIC] %s\n", quicReceiver.lastError().c_str());
+                continue;
+            }
+            if (event.kind != QUIC_AUDIO_EVENT_PACKET)
+                continue;
+            bytesReceived = (int)event.payloadLength;
+            seq = event.sequence;
+            audioData = recvBuf;
+            audioLen = event.payloadLength;
+        }
+        else
+        {
+            bytesReceived = recvfrom(g_udpSocket, (char *)recvBuf, sizeof(recvBuf), 0, (sockaddr *)&clientAddr, &clientLen);
+            if (bytesReceived <= 0)
+                continue;
+            seq = recvBuf[0];
+            audioData = recvBuf + 1;
+            audioLen = bytesReceived - 1;
+        }
 
-        if (bytesReceived <= 0)
-            continue;
-        
-        uint8_t seq = recvBuf[0];
-        const uint8_t* audioData = recvBuf + 1;
-        size_t audioLen = bytesReceived - 1;
-
-        if (discardOutOfOrder) {
+        if (transportMode == AudioTransportMode::Quic) {
+            // QUIC Stream 可靠且有序。序号检查仅作为协议防御；若仍出现短缺口，
+            // 立即用 Opus PLC 隐藏，避免进入 UDP 排序区而累积延迟。
+            if (isNewer(expectedSeq - 1, seq)) {
+                uint8_t gap = seq - expectedSeq;
+                if (gap > 0) {
+                    printf("[QUIC] 序号缺口: 期望 %u, 收到 %u, 缺少 %u 帧\n", expectedSeq, seq, gap);
+                    if (activeCodec == AUDIO_CODEC_OPUS && gap <= 3) {
+                        for (uint8_t i = 0; i < gap; ++i) {
+                            if (opusDecoder.decodeLoss(decodedPcm))
+                                writePcm(decodedPcm);
+                        }
+                    }
+                }
+                if (decodeAudioPayload(audioData, audioLen, decodedPcm)) {
+                    writePcm(decodedPcm);
+                    renderer.setBufferLow(false);
+                }
+                expectedSeq = seq + 1;
+            }
+        } else if (discardOutOfOrder) {
             if (isNewer(expectedSeq - 1, seq)) {
                 if (seq != expectedSeq) {
                     printf("[UDP] [DiscardMode] 跳包: 期望 %u, 收到 %u, 跳过区间 [%u, %u]\n", expectedSeq, seq, expectedSeq, (uint8_t)(seq - 1));
@@ -458,6 +608,7 @@ int main(int argc, char *argv[])
             }
         }
 
+        if (transportMode == AudioTransportMode::Udp)
         {
             uint64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
                                std::chrono::system_clock::now().time_since_epoch())
@@ -475,7 +626,10 @@ int main(int argc, char *argv[])
         delete ringBuffer;
     }
     g_running = false;
-    tcpThread.join();
+    quicReceiver.stop();
+    g_quicReceiver = nullptr;
+    if (tcpThread.joinable())
+        tcpThread.join();
     if (g_udpSocket != INVALID_SOCKET)
         closesocket(g_udpSocket);
     WSACleanup();
